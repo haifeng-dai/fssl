@@ -20,7 +20,7 @@ def args_parser():
     parser.add_argument(
         "--dataset",
         type=str,
-        default="CIFAR100",
+        default="CIFAR10",
         help="基准数据集: 支持 CIFAR10 / CIFAR100 / SVHN / CINIC10",
     )
     parser.add_argument(
@@ -32,19 +32,19 @@ def args_parser():
     parser.add_argument(
         "--num_online_clients",
         type=int,
-        default=8,
+        default=20,
         help="每一轮通信中被随机选中参与训练的活跃客户端数量 (C*K)",
     )
     parser.add_argument(
         "--alpha",
         type=float,
-        default=1.0,
+        default=0.1,
         help="狄利克雷分布浓度参数 alpha (为 0 时表示 IID 独立同分布划分，大于 0 时表示 Non-IID 异构程度)",
     )
     parser.add_argument(
         "--seed",
         type=int,
-        default=7,
+        default=42,
         help="全局随机数种子，用于数据划分与网络初始化复现",
     )
 
@@ -80,17 +80,6 @@ def args_parser():
         type=str,
         default=None,
         help="各 GPU 上分配的进程数配置 (格式为 GPU:进程数，如 '0:2,1:1' 表示 0号卡跑2进程，1号卡跑1进程)",
-    )
-    parser.add_argument(
-        "--dataloader_workers",
-        type=int,
-        default=0,
-        help="每个客户端训练进程内部 DataLoader 派生的子进程数 (多进程架构下建议设为 0 以免进程争用)",
-    )
-    parser.add_argument(
-        "--pin_memory",
-        action="store_true",
-        help="启用 PyTorch DataLoader 锁页内存 (Pin Memory)，加速 CPU 到 GPU 的异步张量搬运",
     )
 
     # =========================================================================
@@ -137,6 +126,12 @@ def args_parser():
         type=float,
         default=1.0,
         help="客户端损失函数中无标签损失 (Lu) 与代理对比损失 (Lc) 的加权系数",
+    )
+    parser.add_argument(
+        "--lambda_proto",
+        type=float,
+        default=1.0,
+        help="客户端特征原型 MSE 校准损失权重",
     )
     parser.add_argument(
         "--T",
@@ -206,28 +201,29 @@ def args_parser():
     # =========================================================================
     dataset_dir = os.path.expanduser("~/datasets")
     parser.add_argument(
-        "--path_cifar10",
+        "--path",
         type=str,
         default=dataset_dir,
-        help="CIFAR-10 数据集在本地的根目录路径",
+        help="所有数据集统一使用的根目录，默认使用 ~/datasets",
+    )
+
+    parser.add_argument(
+        "--anchor_lr",
+        type=float,
+        default=0.01,
+        help="服务端全局锚点学习率",
     )
     parser.add_argument(
-        "--path_cifar100",
-        type=str,
-        default=dataset_dir,
-        help="CIFAR-100 数据集在本地的根目录路径",
+        "--anchor_margin",
+        type=float,
+        default=1.0,
+        help="锚点 L2 对比学习的负样本距离间隔",
     )
     parser.add_argument(
-        "--path_svhn",
-        type=str,
-        default=os.path.join(dataset_dir, "SVHN"),
-        help="SVHN 数据集在本地的存储路径",
-    )
-    parser.add_argument(
-        "--path_cinic10",
-        type=str,
-        default=os.path.join(dataset_dir, "cinic10_extracted"),
-        help="CINIC-10 解压后数据集在本地的存储路径",
+        "--anchor_steps",
+        type=int,
+        default=20,
+        help="每轮服务端全局锚点优化步数",
     )
 
     args = parser.parse_args()

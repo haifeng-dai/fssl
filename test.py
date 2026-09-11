@@ -17,7 +17,7 @@ import torch.multiprocessing as mp
 import torch.nn.functional as F
 from torch.nn import CrossEntropyLoss
 from torch.optim import SGD
-from torch.utils.data import DataLoader, RandomSampler
+from torch.utils.data import DataLoader, RandomSampler, Subset
 from torchvision import datasets
 from torchvision.transforms import transforms
 from tqdm import tqdm
@@ -98,13 +98,12 @@ class Global:
             test_loader = DataLoader(
                 data_test,
                 batch_size_test,
-                pin_memory=self.args.pin_memory,
             )
             num_corrects = 0
             for data_batch in test_loader:
                 images, labels = data_batch
-                images = images.to(self.device, non_blocking=self.args.pin_memory)
-                labels = labels.to(self.device, non_blocking=self.args.pin_memory)
+                images = images.to(self.device)
+                labels = labels.to(self.device)
                 _, outputs = self.model(images)
                 _, predicts = torch.max(outputs, -1)
                 num_corrects += torch.eq(predicts.cpu(), labels.cpu()).sum().item()
@@ -117,6 +116,54 @@ class Global:
             name: value.detach().cpu().clone()
             for name, value in self.model.state_dict().items()
         }
+
+    def aggregate_prototypes(self, prototypes, counts, previous=None):
+        """按类别样本数聚合本地原型；本轮缺失类别沿用旧原型。"""
+        device = self.device
+        total = torch.zeros(self.num_classes, device=device)
+        weighted = torch.zeros_like(prototypes[0], device=device)
+        for proto, count in zip(prototypes, counts):
+            proto, count = proto.to(device), count.to(device)
+            weighted += proto * count.unsqueeze(1)
+            total += count
+        result = weighted / total.clamp_min(1).unsqueeze(1)
+        if previous is not None:
+            valid = total > 0
+            result[~valid] = previous.to(device)[~valid]
+        return result.cpu()
+
+    def learn_anchors(self, prototypes, counts, initial_prototypes):
+        """以聚合原型初始化可学习锚点，并用全部局部原型进行 L2 对比学习。"""
+        anchor = torch.nn.Parameter(initial_prototypes.to(self.device).clone())
+        optimizer = SGD([anchor], lr=self.args.anchor_lr)
+        local_prototypes = []
+        local_labels = []
+        for client_proto, client_count in zip(prototypes, counts):
+            valid = client_count > 0
+            local_prototypes.append(client_proto[valid].to(self.device))
+            local_labels.append(torch.arange(self.num_classes)[valid].to(self.device))
+        if not local_prototypes:
+            return initial_prototypes.detach().cpu().clone()
+        local_prototypes = torch.cat(local_prototypes)
+        local_labels = torch.cat(local_labels)
+        for _ in range(self.args.anchor_steps):
+            distances = torch.cdist(local_prototypes, anchor, p=2)
+            positive = distances[
+                torch.arange(distances.size(0), device=self.device), local_labels
+            ]
+            negative_mask = F.one_hot(local_labels, self.num_classes).bool()
+            negative = distances.masked_fill(negative_mask, float("inf"))
+            loss = (
+                positive.square().mean()
+                + F.relu(self.args.anchor_margin - negative)
+                .square()
+                .masked_fill(negative_mask, 0)
+                .mean()
+            )
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+        return anchor.detach().cpu().clone()
 
 
 class Local:
@@ -148,23 +195,21 @@ class Local:
 
         self.num_classes = args.num_classes
 
-    def fixmatch_train(
+    def train(
         self,
         args,
         data_client_labeled,
         data_client_unlabeled,
         global_params,
-        r,
-        client_idx,
+        global_anchors=None,
     ):
         """标准的 FixMatch 客户端半监督训练：监督交叉熵损失 + 弱强一致性伪标签损失。"""
+        train_start = time.perf_counter()
         labeled_trainloader = DataLoader(
             dataset=data_client_labeled,
             sampler=RandomSampler(data_client_labeled),
             batch_size=args.batch_size_local_labeled_fixmatch,
             drop_last=True,
-            num_workers=args.dataloader_workers,
-            pin_memory=args.pin_memory,
         )
 
         unlabeled_trainloader = DataLoader(
@@ -172,8 +217,6 @@ class Local:
             sampler=RandomSampler(data_client_unlabeled),
             batch_size=args.batch_size_local_labeled_fixmatch * args.mu,
             drop_last=True,
-            num_workers=args.dataloader_workers,
-            pin_memory=args.pin_memory,
         )
 
         # 载入本轮最新的全局参数
@@ -188,39 +231,31 @@ class Local:
         num_u_valid = 0
         pseudo_client_acc = 0.0
         u_client_valid = 0.0
+        # 每个本地 epoch 按无标签 DataLoader 的实际批次数训练。
+        local_iter = len(unlabeled_trainloader)
 
         for local_epoch in range(args.local_epochs):
             labeled_iter = iter(labeled_trainloader)
             unlabeled_iter = iter(unlabeled_trainloader)
 
-            local_iter = int(
-                len(data_client_unlabeled) / args.batch_size_local_labeled_fixmatch
-            )
-
             for _ in range(local_iter):
                 try:
-                    inputs_x, targets_x = labeled_iter.__next__()
+                    inputs_x, targets_x = next(labeled_iter)
                 except StopIteration:
                     labeled_iter = iter(labeled_trainloader)
-                    inputs_x, targets_x = labeled_iter.__next__()
+                    inputs_x, targets_x = next(labeled_iter)
 
                 try:
-                    inputs_u_w, inputs_u_s, targets_u_groundtruth = (
-                        unlabeled_iter.__next__()
-                    )
+                    inputs_u_w, inputs_u_s, targets_u_groundtruth = next(unlabeled_iter)
                 except StopIteration:
                     unlabeled_iter = iter(unlabeled_trainloader)
-                    inputs_u_w, inputs_u_s, targets_u_groundtruth = (
-                        unlabeled_iter.__next__()
-                    )
+                    inputs_u_w, inputs_u_s, targets_u_groundtruth = next(unlabeled_iter)
 
-                inputs_x = inputs_x.to(self.device, non_blocking=args.pin_memory)
-                inputs_u_w = inputs_u_w.to(self.device, non_blocking=args.pin_memory)
-                inputs_u_s = inputs_u_s.to(self.device, non_blocking=args.pin_memory)
-                targets_x = targets_x.to(self.device, non_blocking=args.pin_memory)
-                targets_u_groundtruth = targets_u_groundtruth.to(
-                    self.device, non_blocking=args.pin_memory
-                )
+                inputs_x = inputs_x.to(self.device)
+                inputs_u_w = inputs_u_w.to(self.device)
+                inputs_u_s = inputs_u_s.to(self.device)
+                targets_x = targets_x.to(self.device)
+                targets_u_groundtruth = targets_u_groundtruth.to(self.device)
 
                 batch_size = inputs_x.shape[0]
                 # 交错输入以保持 BatchNorm 统计量平稳
@@ -228,11 +263,13 @@ class Local:
                     torch.cat((inputs_x, inputs_u_w, inputs_u_s)), 2 * args.mu + 1
                 )
 
-                _, logits = self.local_model(inputs)
+                features, logits = self.local_model(inputs)
+                features = self.de_interleave(features, 2 * args.mu + 1)
                 logits = self.de_interleave(logits, 2 * args.mu + 1)
 
                 logits_x = logits[:batch_size]
                 logits_u_w, logits_u_s = logits[batch_size:].chunk(2)
+                features_x = features[:batch_size]
 
                 # 1. 有标签监督交叉熵损失
                 Lx = F.cross_entropy(logits_x, targets_x, reduction="mean")
@@ -248,8 +285,18 @@ class Local:
                     F.cross_entropy(logits_u_s, targets_u, reduction="none") * mask
                 ).mean()
 
+                L_proto = torch.zeros((), device=self.device)
+                if global_anchors is not None:
+                    target_x = global_anchors.to(self.device)[targets_x]
+                    L_proto = F.mse_loss(features_x, target_x)
+                    features_u_w, _ = features[batch_size:].chunk(2)
+                    valid = mask.bool()
+                    if valid.any():
+                        target_u = global_anchors.to(self.device)[targets_u[valid]]
+                        L_proto = L_proto + F.mse_loss(features_u_w[valid], target_u)
+
                 # 总损失 (纯净的 FixMatch 目标函数)
-                loss = Lx + args.lambda_u * Lu
+                loss = Lx + args.lambda_u * Lu + args.lambda_proto * L_proto
 
                 # 统计最后一个 epoch 的伪标签质量
                 if local_epoch + 1 == args.local_epochs:
@@ -272,9 +319,6 @@ class Local:
                 u_client_valid = (
                     num_u_valid / num_pseudo_total if num_pseudo_total else 0.0
                 )
-                logger.info(
-                    f"Round {r}, Local Epoch {local_epoch}, Client {client_idx}, pseudo_acc = {pseudo_client_acc: .4f}, pseudo_num_valid = {num_u_valid}, valid_ratio = {u_client_valid}"
-                )
 
         pseudo_status = [
             num_pseudo_total,
@@ -283,13 +327,54 @@ class Local:
             pseudo_client_acc,
             u_client_valid,
         ]
+        prototypes, prototype_counts = self.compute_prototypes(
+            args, data_client_labeled, data_client_unlabeled
+        )
         return (
             {
                 name: value.detach().cpu().clone()
                 for name, value in self.local_model.state_dict().items()
             },
             pseudo_status,
+            prototypes,
+            prototype_counts,
+            time.perf_counter() - train_start,
         )
+
+    @torch.no_grad()
+    def compute_prototypes(self, args, labeled_dataset, unlabeled_dataset):
+        """用本地训练完成后的最终模型计算本地类别原型。"""
+        self.local_model.eval()
+        sums = torch.zeros(args.num_classes, self.local_model.dim, device=self.device)
+        counts = torch.zeros(args.num_classes, device=self.device)
+        loader = DataLoader(
+            # 训练视图包含 repeat=2000；原型只需对每个原始有标签样本计算一次。
+            Subset(labeled_dataset, range(len(labeled_dataset.indices))),
+            args.batch_size_local_labeled_fixmatch,
+        )
+        for images, labels in loader:
+            images, labels = images.to(self.device), labels.to(self.device)
+            features, _ = self.local_model(images)
+            for c in range(args.num_classes):
+                valid = labels == c
+                if valid.any():
+                    sums[c] += features[valid].sum(0)
+                    counts[c] += valid.sum()
+        loader = DataLoader(
+            unlabeled_dataset,
+            args.batch_size_local_labeled_fixmatch,
+            shuffle=False,
+        )
+        for images, _, _ in loader:
+            images = images.to(self.device)
+            features, logits = self.local_model(images)
+            confidence, labels = torch.softmax(logits / args.T, -1).max(1)
+            for c in range(args.num_classes):
+                valid = (labels == c) & (confidence >= args.threshold)
+                if valid.any():
+                    sums[c] += features[valid].sum(0)
+                    counts[c] += valid.sum()
+        return (sums / counts.clamp_min(1).unsqueeze(1)).cpu(), counts.cpu()
 
     def interleave(self, x, size):
         """将有标签和无标签样本交错排列，以配合 BatchNorm 训练。"""
@@ -311,6 +396,7 @@ class ClientTask:
     labeled_indices: list[int]
     unlabeled_indices: list[int]
     global_params: dict[str, torch.Tensor]
+    global_anchors: torch.Tensor | None
     args: object
 
 
@@ -324,6 +410,9 @@ class ClientResult:
     params: dict[str, torch.Tensor] | None = None
     num_samples: int = 0
     pseudo_status: list[float] | None = None
+    prototypes: torch.Tensor | None = None
+    prototype_counts: torch.Tensor | None = None
+    elapsed_seconds: float = 0.0
     error: str | None = None
 
 
@@ -387,13 +476,18 @@ def _client_worker(
                 unlabeled_view = Indices2Dataset_unlabeled_fixmatch(shared_dataset)
                 unlabeled_view.load(task.unlabeled_indices)
 
-                params, pseudo_status = local.fixmatch_train(
+                (
+                    params,
+                    pseudo_status,
+                    prototypes,
+                    prototype_counts,
+                    elapsed_seconds,
+                ) = local.train(
                     task.args,
                     labeled_view,
                     unlabeled_view,
                     task.global_params,
-                    task.round,
-                    task.client_id,
+                    task.global_anchors,
                 )
                 result_queue.put(
                     ClientResult(
@@ -404,6 +498,9 @@ def _client_worker(
                         num_samples=len(task.labeled_indices) * labeled_view.repeat
                         + len(task.unlabeled_indices),
                         pseudo_status=pseudo_status,
+                        prototypes=prototypes,
+                        prototype_counts=prototype_counts,
+                        elapsed_seconds=elapsed_seconds,
                     )
                 )
             except (
@@ -606,7 +703,8 @@ def _parse_worker_gpus(args):
 
 def fedavg_fixmatch(alpha, args=None):
     """执行纯净的联邦半监督学习 (FedAvg + FixMatch)。"""
-    args = args or args_parser()
+    if args is None:
+        args = args_parser()
     args.method = "FedAvg_FixMatch"
 
     log_dir = f"./results/{args.dataset}/logs"
@@ -634,10 +732,10 @@ def fedavg_fixmatch(alpha, args=None):
             ]
         )
         data_local_training = datasets.CIFAR10(
-            args.path_cifar10, train=True, download=True, transform=None
+            args.path, train=True, download=True, transform=None
         )
         data_global_test = datasets.CIFAR10(
-            args.path_cifar10, train=False, transform=transform_test
+            args.path, train=False, transform=transform_test
         )
 
     elif args.dataset == "CIFAR100":
@@ -653,10 +751,10 @@ def fedavg_fixmatch(alpha, args=None):
             ]
         )
         data_local_training = datasets.CIFAR100(
-            args.path_cifar100, train=True, download=True, transform=None
+            args.path, train=True, download=True, transform=None
         )
         data_global_test = datasets.CIFAR100(
-            args.path_cifar100, train=False, transform=transform_test
+            args.path, train=False, transform=transform_test
         )
 
     elif args.dataset == "SVHN":
@@ -672,10 +770,10 @@ def fedavg_fixmatch(alpha, args=None):
             ]
         )
         data_local_training = datasets.SVHN(
-            args.path_svhn, split="train", download=True, transform=None
+            args.path, split="train", download=True, transform=None
         )
         data_global_test = datasets.SVHN(
-            args.path_svhn, split="test", transform=transform_test, download=True
+            args.path, split="test", transform=transform_test, download=True
         )
 
     elif args.dataset == "CINIC10":
@@ -690,11 +788,9 @@ def fedavg_fixmatch(alpha, args=None):
                 ),
             ]
         )
-        data_local_training = CINIC10(
-            root=args.path_cinic10, split="train", transform=None
-        )
+        data_local_training = CINIC10(root=args.path, split="train", transform=None)
         data_global_test = CINIC10(
-            root=args.path_cinic10, split="test", transform=transform_test
+            root=args.path, split="test", transform=transform_test
         )
 
     else:
@@ -774,8 +870,12 @@ def fedavg_fixmatch(alpha, args=None):
     fedavg_pseudo_acc: list[float] = []
     fedavg_num_valid: list[int] = []
     fedavg_valid_ratio: list[float] = []
+    # 第一轮尚未有服务器端原型，聚合时作为 previous 传入 None。
+    global_prototypes = None
+    global_anchors = None
 
-    for r in tqdm(range(1, args.num_rounds + 1), desc="Server"):
+    progress = tqdm(range(1, args.num_rounds + 1), desc="Test")
+    for r in progress:
         dict_global_params = global_model.download_params()
         online_clients = random_state.choice(
             total_clients, args.num_online_clients, replace=False
@@ -800,6 +900,7 @@ def fedavg_fixmatch(alpha, args=None):
                     else list(list_client2indices_unlabeled[client])
                 ),
                 global_params=dict_global_params,
+                global_anchors=global_anchors,
                 args=copy.deepcopy(args),
             )
             for client in online_clients
@@ -807,6 +908,16 @@ def fedavg_fixmatch(alpha, args=None):
         results = worker_pool.run_round(tasks)
         list_dicts_local_params = [result.params for result in results]
         list_nums_local_data = [result.num_samples for result in results]
+        global_prototypes = global_model.aggregate_prototypes(
+            [result.prototypes for result in results],
+            [result.prototype_counts for result in results],
+            global_prototypes,
+        )
+        global_anchors = global_model.learn_anchors(
+            [result.prototypes for result in results],
+            [result.prototype_counts for result in results],
+            global_prototypes,
+        )
 
         for result in results:
             pseudo_status = result.pseudo_status
@@ -835,9 +946,7 @@ def fedavg_fixmatch(alpha, args=None):
         )
         fedavg_acc.append(global_acc)
 
-        print(
-            f"round {r}, accuracy:{global_acc}, pseudo_acc:{fedavg_pseudo_acc[-1]}, num_valid:{fedavg_num_valid[-1]}, valid_ratio:{fedavg_valid_ratio[-1]}"
-        )
+        progress.set_postfix(acc=f"{global_acc:.2%}")
 
         result_dir = f"./results/{args.dataset}"
         os.makedirs(result_dir, exist_ok=True)

@@ -131,12 +131,11 @@ class Global:
             self.args.bs_server,
             drop_last=False,
             shuffle=True,
-            pin_memory=self.args.pin_memory,
         )
         for _ in range(self.server_epochs):
             for proxy, y in proxy_loader:
-                proxy = proxy.to(self.device, non_blocking=self.args.pin_memory)
-                y = y.to(self.device, non_blocking=self.args.pin_memory)
+                proxy = proxy.to(self.device)
+                y = y.to(self.device)
                 proxy_g = self.GPT.weight
                 dist = torch.cdist(proxy, proxy_g)
 
@@ -191,13 +190,12 @@ class Global:
             test_loader = DataLoader(
                 data_test,
                 batch_size_test,
-                pin_memory=self.args.pin_memory,
             )
             num_corrects = 0
             for data_batch in test_loader:
                 images, labels = data_batch
-                images = images.to(self.device, non_blocking=self.args.pin_memory)
-                labels = labels.to(self.device, non_blocking=self.args.pin_memory)
+                images = images.to(self.device)
+                labels = labels.to(self.device)
                 _, outputs = self.model(images)
                 _, predicts = torch.max(outputs, -1)
                 num_corrects += torch.eq(predicts.cpu(), labels.cpu()).sum().item()
@@ -304,9 +302,6 @@ class Local:
             sampler=RandomSampler(data_client_labeled),
             batch_size=args.batch_size_local_labeled_fixmatch,
             drop_last=True,
-            num_workers=args.dataloader_workers,
-            pin_memory=args.pin_memory,
-            persistent_workers=args.dataloader_workers > 0,
         )
 
         self.unlabeled_trainloader = DataLoader(
@@ -314,9 +309,6 @@ class Local:
             sampler=RandomSampler(data_client_unlabeled),
             batch_size=args.batch_size_local_labeled_fixmatch * args.mu,
             drop_last=True,
-            num_workers=args.dataloader_workers,
-            pin_memory=args.pin_memory,
-            persistent_workers=args.dataloader_workers > 0,
         )
 
         self.local_model.load_state_dict(global_params)
@@ -363,12 +355,12 @@ class Local:
                         unlabeled_iter.__next__()
                     )
 
-                inputs_x = inputs_x.to(self.device, non_blocking=args.pin_memory)
-                inputs_u_w = inputs_u_w.to(self.device, non_blocking=args.pin_memory)
-                inputs_u_s = inputs_u_s.to(self.device, non_blocking=args.pin_memory)
-                targets_x = targets_x.to(self.device, non_blocking=args.pin_memory)
+                inputs_x = inputs_x.to(self.device)
+                inputs_u_w = inputs_u_w.to(self.device)
+                inputs_u_s = inputs_u_s.to(self.device)
+                targets_x = targets_x.to(self.device)
                 targets_u_groundtruth = targets_u_groundtruth.to(
-                    self.device, non_blocking=args.pin_memory
+                    self.device
                 )
 
                 batch_size = inputs_x.shape[0]
@@ -896,7 +888,8 @@ def fixmatch(alpha, args=None):
     """执行完整的 ProxyFL：数据划分、并行本地训练、聚合、评估和保存。"""
 
     # ==================== 初始化参数和日志 ====================
-    args = args or args_parser()
+    if args is None:
+        args = args_parser()
     args.method = f"ProxyFL_{args.total_server_epochs // 1000}k"
 
     log_dir = f"./results/{args.dataset}/logs"
@@ -925,10 +918,10 @@ def fixmatch(alpha, args=None):
             ]
         )
         data_local_training = datasets.CIFAR10(
-            args.path_cifar10, train=True, download=True, transform=None
+            args.path, train=True, download=True, transform=None
         )
         data_global_test = datasets.CIFAR10(
-            args.path_cifar10, train=False, transform=transform_test
+            args.path, train=False, transform=transform_test
         )
 
     elif (
@@ -947,10 +940,10 @@ def fixmatch(alpha, args=None):
             ]
         )
         data_local_training = datasets.CIFAR100(
-            args.path_cifar100, train=True, download=True, transform=None
+            args.path, train=True, download=True, transform=None
         )
         data_global_test = datasets.CIFAR100(
-            args.path_cifar100, train=False, transform=transform_test
+            args.path, train=False, transform=transform_test
         )
 
     elif args.dataset == "SVHN":
@@ -967,10 +960,10 @@ def fixmatch(alpha, args=None):
             ]
         )
         data_local_training = datasets.SVHN(
-            args.path_svhn, split="train", download=True, transform=None
+            args.path, split="train", download=True, transform=None
         )
         data_global_test = datasets.SVHN(
-            args.path_svhn, split="test", transform=transform_test, download=True
+            args.path, split="test", transform=transform_test, download=True
         )
 
     elif args.dataset == "CINIC10":
@@ -987,10 +980,10 @@ def fixmatch(alpha, args=None):
             ]
         )
         data_local_training = CINIC10(
-            root=args.path_cinic10, split="train", transform=None
+            root=args.path, split="train", transform=None
         )
         data_global_test = CINIC10(
-            root=args.path_cinic10, split="test", transform=transform_test
+            root=args.path, split="test", transform=transform_test
         )
 
     else:
@@ -1006,7 +999,8 @@ def fixmatch(alpha, args=None):
         f"non_iid:{args.alpha}\n"
         f"mu:{args.mu}\n"
         f"num_rounds:{args.num_rounds}\n"
-        f"batch_label:{args.batch_label}, batch_unlabel:{args.batch_unlabel}"
+        f"batch_label:{args.batch_size_local_labeled_fixmatch}, "
+        f"batch_unlabel:{args.batch_size_local_labeled_fixmatch * args.mu}"
     )
 
     # ==================== 按类别划分数据索引 ====================
