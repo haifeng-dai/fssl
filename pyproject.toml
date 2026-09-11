@@ -20,6 +20,9 @@ dependencies = [
 requires = ["uv_build>=0.12.5,<0.13.0"]
 build-backend = "uv_build"
 
+[tool.uv]
+package = false
+
 [[tool.uv.index]]
 name = "pypi"
 url = "https://mirrors.seu.edu.cn/pypi/index"

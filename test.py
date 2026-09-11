@@ -38,6 +38,13 @@ from options import args_parser
 logger = logging.getLogger(__name__)
 
 
+def l2_prototype_contrastive_loss(features, labels, anchors, temperature):
+    """L2 距离版 InfoNCE：标签类 anchor 为正对，其余 anchor 均为负对。"""
+    negative_squared_distances = -torch.cdist(features, anchors, p=2).square()
+    logits = negative_squared_distances / temperature
+    return F.cross_entropy(logits, labels)
+
+
 class Global:
     """服务端状态：维护全局模型并执行标准的 FedAvg 参数加权聚合与评估。"""
 
@@ -133,7 +140,7 @@ class Global:
         return result.cpu()
 
     def learn_anchors(self, prototypes, counts, initial_prototypes):
-        """以聚合原型初始化可学习锚点，并用全部局部原型进行 L2 对比学习。"""
+        """以聚合原型初始化 anchor，并以客户端类别原型执行 L2 InfoNCE。"""
         anchor = torch.nn.Parameter(initial_prototypes.to(self.device).clone())
         optimizer = SGD([anchor], lr=self.args.anchor_lr)
         local_prototypes = []
@@ -147,18 +154,11 @@ class Global:
         local_prototypes = torch.cat(local_prototypes)
         local_labels = torch.cat(local_labels)
         for _ in range(self.args.anchor_steps):
-            distances = torch.cdist(local_prototypes, anchor, p=2)
-            positive = distances[
-                torch.arange(distances.size(0), device=self.device), local_labels
-            ]
-            negative_mask = F.one_hot(local_labels, self.num_classes).bool()
-            negative = distances.masked_fill(negative_mask, float("inf"))
-            loss = (
-                positive.square().mean()
-                + F.relu(self.args.anchor_margin - negative)
-                .square()
-                .masked_fill(negative_mask, 0)
-                .mean()
+            loss = l2_prototype_contrastive_loss(
+                local_prototypes,
+                local_labels,
+                anchor,
+                self.args.proto_temperature,
             )
             optimizer.zero_grad()
             loss.backward()
@@ -167,7 +167,7 @@ class Global:
 
 
 class Local:
-    """客户端本地半监督训练器 (标准 FixMatch)。"""
+    """客户端训练器：本地/全局置信度联合筛选，使用全局教师伪标签。"""
 
     def __init__(self, args, device=None):
         self.device = device or torch.device(
@@ -184,6 +184,18 @@ class Local:
             num_classes=args.num_classes,
         )
         self.local_model.to(self.device)
+
+        # 与学生模型分离，避免本地更新改变本轮全局教师的预测。
+        self.global_teacher = ResNet_PC(
+            resnet_size=8,
+            scaling=4,
+            save_activations=False,
+            group_norm_num_groups=None,
+            freeze_bn=False,
+            freeze_bn_affine=False,
+            num_classes=args.num_classes,
+        )
+        self.global_teacher.to(self.device)
 
         self.criterion = CrossEntropyLoss().to(self.device)
         self.optimizer = SGD(
@@ -203,7 +215,7 @@ class Local:
         global_params,
         global_anchors=None,
     ):
-        """标准的 FixMatch 客户端半监督训练：监督交叉熵损失 + 弱强一致性伪标签损失。"""
+        """本地/全局置信度并集筛选，固定全局教师提供无标签目标。"""
         train_start = time.perf_counter()
         labeled_trainloader = DataLoader(
             dataset=data_client_labeled,
@@ -221,6 +233,8 @@ class Local:
 
         # 载入本轮最新的全局参数
         self.local_model.load_state_dict(global_params)
+        self.global_teacher.load_state_dict(global_params)
+        self.global_teacher.eval()
         # 彻底清空 SGD 动量，保证各客户端状态隔离
         self.optimizer.state.clear()
         self.local_model.train()
@@ -274,28 +288,52 @@ class Local:
                 # 1. 有标签监督交叉熵损失
                 Lx = F.cross_entropy(logits_x, targets_x, reduction="mean")
 
-                # 2. 无标签弱增强生成伪标签 (Stop Gradient)
+                # 2. 本地或全局弱增强预测达到阈值即采纳，但始终使用全局目标类别。
                 with torch.no_grad():
-                    pseudo_label = torch.softmax(logits_u_w / args.T, dim=-1)
-                    max_probs, targets_u = torch.max(pseudo_label, dim=-1)
-                    mask = max_probs.ge(args.threshold).float()
+                    probs_u_w_local = torch.softmax(logits_u_w / args.T, dim=-1)
+                    max_probs_local, _ = torch.max(probs_u_w_local, dim=-1)
+                    mask_local = max_probs_local.ge(args.threshold)
 
-                # 3. 无标签强增强的一致性预测损失 (标准 CrossEntropy + 置信度阈值 Mask)
+                    _, logits_u_w_global = self.global_teacher(inputs_u_w)
+                    probs_u_w_global = torch.softmax(logits_u_w_global / args.T, dim=-1)
+                    max_probs_global, targets_u = torch.max(probs_u_w_global, dim=-1)
+                    mask_global = max_probs_global.ge(args.threshold)
+
+                    mask = torch.logical_or(mask_local, mask_global).float()
+
+                # 3. 无标签强增强的一致性 KL 损失，以全局教师硬伪标签为目标。
+                logits_u_s_probs = torch.softmax(logits_u_s, dim=-1).clamp_min(1e-10)
+                targets_u_one_hot = F.one_hot(
+                    targets_u, num_classes=args.num_classes
+                ).float()
                 Lu = (
-                    F.cross_entropy(logits_u_s, targets_u, reduction="none") * mask
+                    F.kl_div(
+                        logits_u_s_probs.log(),
+                        targets_u_one_hot,
+                        reduction="none",
+                    ).sum(dim=-1)
+                    * mask
                 ).mean()
 
+                # 类别 anchor 是正样本，其余类别 anchor 都是负样本。
+                # 保持原有视图选择：有标签样本使用其特征，无标签样本仅使用弱增强且需通过 mask。
                 L_proto = torch.zeros((), device=self.device)
                 if global_anchors is not None:
-                    target_x = global_anchors.to(self.device)[targets_x]
-                    L_proto = F.mse_loss(features_x, target_x)
+                    anchors = global_anchors.to(self.device)
+                    L_proto = l2_prototype_contrastive_loss(
+                        features_x, targets_x, anchors, args.proto_temperature
+                    )
                     features_u_w, _ = features[batch_size:].chunk(2)
                     valid = mask.bool()
                     if valid.any():
-                        target_u = global_anchors.to(self.device)[targets_u[valid]]
-                        L_proto = L_proto + F.mse_loss(features_u_w[valid], target_u)
+                        L_proto = L_proto + l2_prototype_contrastive_loss(
+                            features_u_w[valid],
+                            targets_u[valid],
+                            anchors,
+                            args.proto_temperature,
+                        )
 
-                # 总损失 (纯净的 FixMatch 目标函数)
+                # 总损失：FixMatch 分类目标加上原型对比目标。
                 loss = Lx + args.lambda_u * Lu + args.lambda_proto * L_proto
 
                 # 统计最后一个 epoch 的伪标签质量

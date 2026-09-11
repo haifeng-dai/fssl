@@ -131,7 +131,13 @@ def args_parser():
         "--lambda_proto",
         type=float,
         default=1.0,
-        help="客户端特征原型 MSE 校准损失权重",
+        help="客户端原型对比损失权重",
+    )
+    parser.add_argument(
+        "--proto_temperature",
+        type=float,
+        default=0.1,
+        help="样本-原型 InfoNCE 对比损失的温度系数",
     )
     parser.add_argument(
         "--T",
