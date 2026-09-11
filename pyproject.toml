@@ -1,0 +1,42 @@
+[project]
+name = "proxyfl"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Haifeng Dai", email = "haifeng_dai@seu.edu.cn" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "numpy>=2.5.3",
+    "pandas>=3.0.5",
+    "pillow>=12.3.0",
+    "torch>=2.14.0",
+    "torchvision>=0.29.0",
+    "tqdm>=4.70.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://mirrors.seu.edu.cn/pypi/index"
+default = true
+
+[[tool.uv.index]]
+name = "pytorch-cu132"
+url = "https://mirrors.seu.edu.cn/pytorch/whl/cu132/simple"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu132", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+torchvision = [
+  { index = "pytorch-cu132", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+torchaudio = [
+  { index = "pytorch-cu132", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
