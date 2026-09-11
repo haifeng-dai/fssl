@@ -4,3 +4,4 @@ __pycache__/
 *.zip
 *.log
 uv.lock
+results/

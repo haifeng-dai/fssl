@@ -56,7 +56,11 @@ class ResNet_PC(nn.Module):
         self.relu = nn.ReLU(inplace=True)
 
         self.inplanes = planes1
-        self.layer1 = self._make_block(planes1, block_nums, group_norm_num_groups)
+        self.layer1 = self._make_block(
+            planes1,
+            block_nums,
+            group_norm_num_groups=group_norm_num_groups,
+        )
         self.layer2 = self._make_block(planes2, block_nums, stride=2, group_norm_num_groups=group_norm_num_groups)
         self.layer3 = self._make_block(planes3, block_nums, stride=2, group_norm_num_groups=group_norm_num_groups)
 

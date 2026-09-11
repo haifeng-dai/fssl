@@ -5,9 +5,49 @@ import os
 
 def args_parser():
     parser = argparse.ArgumentParser()
-    # trainer name
+    # 训练方法名称
     parser.add_argument("--method", type=str, default="SAGE", help="SAGE/SAGESC")
-    parser.add_argument("--gpu_id", type=int, default=0)
+    parser.add_argument(
+        "--gpu_id",
+        type=int,
+        default=0,
+        help="兼容单 GPU 的旧参数；未指定 --client_gpus 时使用",
+    )
+    parser.add_argument(
+        "--client_gpus",
+        type=str,
+        default=None,
+        help="客户端 worker 使用的 GPU 编号，例如 0,1,2,3",
+    )
+    parser.add_argument(
+        "--server_gpu",
+        type=int,
+        default=None,
+        help="服务端聚合和评估使用的 GPU，默认使用第一个客户端 GPU",
+    )
+    parser.add_argument(
+        "--max_parallel_clients",
+        type=int,
+        default=None,
+        help="最大客户端 worker 数；默认等于 GPU 数量",
+    )
+    parser.add_argument(
+        "--gpu_processes",
+        type=str,
+        default=None,
+        help="每张 GPU 的训练进程数，例如 0:2,1:1,2:2",
+    )
+    parser.add_argument(
+        "--dataloader_workers",
+        type=int,
+        default=0,
+        help="每个客户端训练进程使用的 DataLoader worker 数量",
+    )
+    parser.add_argument(
+        "--pin_memory",
+        action="store_true",
+        help="启用 CPU 锁页内存，以便异步向 GPU 传输数据",
+    )
     parser.add_argument(
         "--dataset",
         type=str,
@@ -65,7 +105,7 @@ def args_parser():
     parser.add_argument("--gpt_threshold", type=float, default=100.0)
     parser.add_argument("--total_server_epochs", type=int, default=30000)
 
-    # dataset path
+    # 数据集路径
     dataset_dir = os.path.expanduser("~/datasets")
     parser.add_argument("--path_cifar10", type=str, default=dataset_dir)
     parser.add_argument("--path_cifar100", type=str, default=dataset_dir)
@@ -78,7 +118,7 @@ def args_parser():
         default=os.path.join(dataset_dir, "cinic10_extracted"),
     )
 
-    # ------------- ablation study -------------#
+    # ------------- 消融实验 -------------#
     parser.add_argument(
         "--SAGE_fixed_p",
         default=0.5,
@@ -94,7 +134,7 @@ def args_parser():
 
     parser.add_argument("--seed", type=int, default=7)
 
-    # ------------- baselines -------------#
+    # ------------- 基线方法 -------------#
     # FedProx
     parser.add_argument(
         "--lambda_prox", default=0.001, type=float, help="coefficient of FedProx"

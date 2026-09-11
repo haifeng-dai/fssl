@@ -1,6 +1,5 @@
-import logging
-
 import numpy as np
+from PIL import Image
 from torch.utils.data.dataset import Dataset
 from torchvision import transforms
 
@@ -8,18 +7,36 @@ from .randaugment import RandAugmentMC
 
 
 def classify_label(dataset, num_classes: int):
+    """按类别收集数据集样本下标。"""
     list1 = [[] for _ in range(num_classes)]
     for idx, datum in enumerate(dataset):
         list1[datum[1]].append(idx)
     return list1
 
 
+def partition_train(list_label2indices: list, ipc):
+    """从每个类别中随机抽取 ipc 个样本，其余样本作为无标签数据。"""
+
+    list_label2indices_labeled = []
+    list_label2indices_unlabeled = []
+
+    # 每个类别独立打乱，保证抽取过程不受原始顺序影响。
+    for indices in list_label2indices:
+        idx_shuffle = np.random.permutation(indices)
+
+        list_label2indices_labeled.append(idx_shuffle[:ipc])
+        list_label2indices_unlabeled.append(idx_shuffle[ipc:])
+    return list_label2indices_labeled, list_label2indices_unlabeled
+
+
 def show_clients_data_distribution(
     dataset, clients_indices_labeled, clients_indices_unlabeled, num_classes
 ):
+    """统计并打印每个客户端的有标签和无标签类别分布。"""
     dict_per_client_labeled = []
     dict_per_client_unlabeled = []
 
+    # 逐个客户端统计两类数据的标签数量。
     for client, indices in enumerate(
         zip(clients_indices_labeled, clients_indices_unlabeled)
     ):
@@ -43,23 +60,32 @@ def show_clients_data_distribution(
     return dict_per_client_labeled, dict_per_client_unlabeled
 
 
-def partition_train(list_label2indices: list, ipc):
+class SharedImageDataset(Dataset):
+    """从 CPU 共享内存中按索引读取原始图片和标签。"""
 
-    list_label2indices_labeled = []
-    list_label2indices_unlabeled = []
+    def __init__(self, images, labels):
+        """保存共享图片张量和共享标签张量，不复制底层数据。"""
+        self.images = images
+        self.labels = labels
 
-    for indices in list_label2indices:
-        idx_shuffle = np.random.permutation(indices)
+    def __getitem__(self, index):
+        """将共享内存中的单张图片转换为 PIL 图片并返回标签。"""
+        image = Image.fromarray(self.images[index].numpy())
+        return image, int(self.labels[index].item())
 
-        list_label2indices_labeled.append(idx_shuffle[:ipc])
-        list_label2indices_unlabeled.append(idx_shuffle[ipc:])
-    return list_label2indices_labeled, list_label2indices_unlabeled
+    def __len__(self):
+        """返回共享数据集中的样本数。"""
+        return self.images.shape[0]
 
 
 class Indices2Dataset_labeled(Dataset):
-    def __init__(self, dataset):
+    """客户端有标签数据视图，只保存全局数据集下标。"""
+
+    def __init__(self, dataset, repeat=2000):
+        """创建有标签视图，并配置随机增强和归一化操作。"""
         self.dataset = dataset
         self.indices = None
+        self.repeat = repeat
         self.label_trans = transforms.Compose(
             [
                 transforms.RandomHorizontalFlip(),
@@ -74,25 +100,26 @@ class Indices2Dataset_labeled(Dataset):
         )
 
     def load(self, indices: list):
-        self.indices = indices
-
-        self.client_dataset = [self.dataset[i] for i in indices]
-        self.client_dataset *= 2000
-        # 因为使用batch 128时，每次epoch都需要重新 iter(dataset) 一次，每次100ms
-        # 这里复制多次dataset，减少运行 iter 函数的次数
-        # 数字是随便定的
+        """加载当前客户端的样本下标，不复制图片对象。"""
+        # 只保存索引。旧实现会将每张图片复制数千次，多 GPU worker 会显著放大内存占用。
+        self.indices = list(indices)
 
     def __getitem__(self, idx):
-        image, label = self.client_dataset[idx]
+        """按循环下标取样，并执行一次有标签数据增强。"""
+        image, label = self.dataset[self.indices[idx % len(self.indices)]]
         image = self.label_trans(image)
         return image, label
 
     def __len__(self):
-        return len(self.client_dataset)
+        """返回逻辑长度；repeat 只扩大采样次数，不扩大内存占用。"""
+        return len(self.indices) * self.repeat if self.indices else 0
 
 
 class Indices2Dataset_unlabeled_fixmatch(Dataset):
+    """客户端无标签数据视图，为同一图片生成弱增强和强增强样本。"""
+
     def __init__(self, dataset):
+        """创建弱增强、强增强和归一化变换。"""
         self.dataset = dataset
         self.indices = None
         self.weak = transforms.Compose(
@@ -122,23 +149,24 @@ class Indices2Dataset_unlabeled_fixmatch(Dataset):
         )
 
     def load(self, indices: list):
-        self.indices = indices
-
-        self.client_dataset = [self.dataset[i] for i in self.indices]
-        self.client_dataset_len = len(self.client_dataset)
-        self.client_dataset *= 50  # save time loading data
+        """加载当前客户端的无标签样本下标。"""
+        # 与有标签数据相同，不为每个客户端复制图片对象。
+        self.indices = list(indices)
+        self.client_dataset_len = len(self.indices)
 
     def fixmatch(self, image):
+        """对同一原始图片分别执行弱增强和强增强。"""
         weak = self.weak(image)
         strong = self.strong(image)
         return self.normalize(weak), self.normalize(strong)
 
     def __getitem__(self, idx):
-
-        image, label = self.client_dataset[idx]
+        """读取一个样本并返回弱增强图、强增强图及其真实标签。"""
+        image, label = self.dataset[self.indices[idx]]
 
         image1, image2 = self.fixmatch(image)
         return image1, image2, label
 
     def __len__(self):
+        """返回当前客户端无标签视图的逻辑长度。"""
         return self.client_dataset_len
