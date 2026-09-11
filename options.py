@@ -4,180 +4,231 @@ import os
 
 
 def args_parser():
-    parser = argparse.ArgumentParser()
-    # 训练方法名称
-    parser.add_argument("--method", type=str, default="SAGE", help="SAGE/SAGESC")
-    parser.add_argument(
-        "--gpu_id",
-        type=int,
-        default=0,
-        help="兼容单 GPU 的旧参数；未指定 --client_gpus 时使用",
+    parser = argparse.ArgumentParser(
+        description="联邦半监督学习 (ProxyFL) 命令行参数解析"
     )
+
+    # =========================================================================
+    # 1. 基础实验与联邦拓扑参数 (Federated Learning & Basic Config)
+    # =========================================================================
     parser.add_argument(
-        "--client_gpus",
+        "--method",
         type=str,
-        default=None,
-        help="客户端 worker 使用的 GPU 编号，例如 0,1,2,3",
-    )
-    parser.add_argument(
-        "--server_gpu",
-        type=int,
-        default=None,
-        help="服务端聚合和评估使用的 GPU，默认使用第一个客户端 GPU",
-    )
-    parser.add_argument(
-        "--max_parallel_clients",
-        type=int,
-        default=None,
-        help="最大客户端 worker 数；默认等于 GPU 数量",
-    )
-    parser.add_argument(
-        "--gpu_processes",
-        type=str,
-        default=None,
-        help="每张 GPU 的训练进程数，例如 0:2,1:1,2:2",
-    )
-    parser.add_argument(
-        "--dataloader_workers",
-        type=int,
-        default=0,
-        help="每个客户端训练进程使用的 DataLoader worker 数量",
-    )
-    parser.add_argument(
-        "--pin_memory",
-        action="store_true",
-        help="启用 CPU 锁页内存，以便异步向 GPU 传输数据",
+        default="ProxyFL",
+        help="训练方法/算法标识名称 (保存路径与日志命名前缀)",
     )
     parser.add_argument(
         "--dataset",
         type=str,
         default="CIFAR100",
-        help="CIFAR10 / CIFAR100 / SVHN / CINIC10",
+        help="基准数据集: 支持 CIFAR10 / CIFAR100 / SVHN / CINIC10",
     )
     parser.add_argument(
         "--num_clients",
         type=int,
         default=20,
-        help="Total number of clients in the federated learning setup",
+        help="参与联邦学习系统的客户端总数量 (K)",
     )
     parser.add_argument(
         "--num_online_clients",
         type=int,
         default=8,
-        help="Number of clients participating in each communication round",
+        help="每一轮通信中被随机选中参与训练的活跃客户端数量 (C*K)",
     )
     parser.add_argument(
-        "--mu",
-        default=2,
-        type=int,
-        help="Number of augmentations for unlabeled samples",
-    )
-    parser.add_argument("--alpha", type=float, default=1, help="Dirichlet distribution")
-    parser.add_argument(
-        "--threshold", default=0.95, type=float, help="Pseudo-label threshold"
-    )
-    parser.add_argument(
-        "--lambda_u", default=1, type=float, help="Coefficient of unlabeled loss"
-    )
-    parser.add_argument("--batch_size_local_labeled_fixmatch", type=int, default=128)
-    parser.add_argument(
-        "--kappa",
-        default=0.5,
+        "--alpha",
         type=float,
-        help="Hyperparameter for controlling sensitivity to confidence discrepancy in CDSC",
+        default=1.0,
+        help="狄利克雷分布浓度参数 alpha (为 0 时表示 IID 独立同分布划分，大于 0 时表示 Non-IID 异构程度)",
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=7,
+        help="全局随机数种子，用于数据划分与网络初始化复现",
+    )
+
+    # =========================================================================
+    # 2. 多卡/多进程与硬件加速参数 (Multi-GPU & Worker Pool Config)
+    # =========================================================================
+    parser.add_argument(
+        "--gpu_id",
+        type=int,
+        default=0,
+        help="单 GPU 兼容参数；当未指定 --client_gpus 时默认使用的物理 GPU 卡号",
+    )
+    parser.add_argument(
+        "--client_gpus",
+        type=str,
+        default=None,
+        help="客户端并行 Worker 进程可调度的 GPU 列表 (逗号分隔，如 '0,1,2,3')",
+    )
+    parser.add_argument(
+        "--server_gpu",
+        type=int,
+        default=None,
+        help="服务端聚合、代理优化与全局评估使用的 GPU 卡号 (默认使用 client_gpus 中的第一张卡)",
+    )
+    parser.add_argument(
+        "--max_parallel_clients",
+        type=int,
+        default=None,
+        help="最大并发客户端 Worker 进程总数上限 (默认等于参与调度的 GPU 数量)",
+    )
+    parser.add_argument(
+        "--gpu_processes",
+        type=str,
+        default=None,
+        help="各 GPU 上分配的进程数配置 (格式为 GPU:进程数，如 '0:2,1:1' 表示 0号卡跑2进程，1号卡跑1进程)",
+    )
+    parser.add_argument(
+        "--dataloader_workers",
+        type=int,
+        default=0,
+        help="每个客户端训练进程内部 DataLoader 派生的子进程数 (多进程架构下建议设为 0 以免进程争用)",
+    )
+    parser.add_argument(
+        "--pin_memory",
+        action="store_true",
+        help="启用 PyTorch DataLoader 锁页内存 (Pin Memory)，加速 CPU 到 GPU 的异步张量搬运",
+    )
+
+    # =========================================================================
+    # 3. 客户端本地半监督训练参数 (Client-side FixMatch & ICPL Config)
+    # =========================================================================
     parser.add_argument(
         "--local_epochs",
         type=int,
         default=5,
-        help="local training epochs in local training",
+        help="每个客户端在每一轮通信中本地迭代训练的 epoch 轮数 (E)",
     )
-    parser.add_argument("--batch_size_local_labeled", type=int, default=128)
-    parser.add_argument("--batch_size_local_unlabeled", type=int, default=128)
-    parser.add_argument("--batch_size_test", type=int, default=512)
-
-    parser.add_argument("--lr_local_training", type=float, default=0.1)
-    parser.add_argument("--lr_distillation_training", type=float, default=0.1)
-
-    parser.add_argument("--lr_server", type=float, default=0.01)
-    parser.add_argument("--server_epochs", type=int, default=100)
-    parser.add_argument("--bs_server", type=int, default=10)
-    parser.add_argument("--gpt_threshold", type=float, default=100.0)
-    parser.add_argument("--total_server_epochs", type=int, default=30000)
-
-    # 数据集路径
-    dataset_dir = os.path.expanduser("~/datasets")
-    parser.add_argument("--path_cifar10", type=str, default=dataset_dir)
-    parser.add_argument("--path_cifar100", type=str, default=dataset_dir)
     parser.add_argument(
-        "--path_svhn", type=str, default=os.path.join(dataset_dir, "SVHN")
+        "--lr_local_training",
+        type=float,
+        default=0.1,
+        help="客户端本地 SGD 优化器的初始学习率 (eta_l)",
+    )
+    parser.add_argument(
+        "--batch_size_local_labeled_fixmatch",
+        type=int,
+        default=128,
+        help="FixMatch 训练时有标签数据的批次大小 (B)",
+    )
+    parser.add_argument(
+        "--batch_size_test",
+        type=int,
+        default=512,
+        help="服务端评估全局模型测试集时的批次大小",
+    )
+    parser.add_argument(
+        "--mu",
+        type=int,
+        default=2,
+        help="无标签样本与有标签样本的批大小比例倍数 (即无标签 batch size = B * mu)",
+    )
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=0.95,
+        help="FixMatch 伪标签置信度截断阈值 (tau)，超过该阈值的无标签样本才计算分类交叉熵损失",
+    )
+    parser.add_argument(
+        "--lambda_u",
+        type=float,
+        default=1.0,
+        help="客户端损失函数中无标签损失 (Lu) 与代理对比损失 (Lc) 的加权系数",
+    )
+    parser.add_argument(
+        "--T",
+        type=float,
+        default=1.0,
+        help="计算软伪标签时的温度系数 (Temperature)",
+    )
+
+    # =========================================================================
+    # 4. 服务端代理调优参数 (Server-side ProxyFL / GPT Config)
+    # =========================================================================
+    parser.add_argument(
+        "--lr_server",
+        type=float,
+        default=0.01,
+        help="服务端代理网络 (GPT 分类头) 的优化学习率 (eta_s)",
+    )
+    parser.add_argument(
+        "--total_server_epochs",
+        type=int,
+        default=30000,
+        help="整个联邦训练全流程中服务端代理网络累计优化的总 epoch 轮数 (用于计算每轮轮数与实验命名)",
+    )
+    parser.add_argument(
+        "--server_epochs",
+        type=int,
+        default=100,
+        help="服务端每轮通信中代理网络优化的目标轮数 (若代码自动计算则作为基准参考)",
+    )
+    parser.add_argument(
+        "--bs_server",
+        type=int,
+        default=10,
+        help="服务端代理训练时 DataLoader 加载虚拟代理样本 (Proxies) 的批大小",
+    )
+    parser.add_argument(
+        "--gpt_threshold",
+        type=float,
+        default=100.0,
+        help="服务端代理训练中类别距离安全间隔 (Margin) 截断上限，防止训练发散",
+    )
+
+    # =========================================================================
+    # 5. 脚本调用与日志输出兼容参数 (Logging & Shell Compatibility)
+    # =========================================================================
+    parser.add_argument(
+        "--batch_label",
+        type=int,
+        default=128,
+        help="日志与旧脚本兼容参数：有标签批次大小",
+    )
+    parser.add_argument(
+        "--batch_unlabel",
+        type=int,
+        default=128,
+        help="日志与旧脚本兼容参数：无标签批次大小",
+    )
+    parser.add_argument(
+        "--topk",
+        type=float,
+        default=0.2,
+        help="训练脚本 (train.sh) 传递的兼容参数",
+    )
+
+    # =========================================================================
+    # 6. 本地数据集文件路径配置 (Dataset Path Config)
+    # =========================================================================
+    dataset_dir = os.path.expanduser("~/datasets")
+    parser.add_argument(
+        "--path_cifar10",
+        type=str,
+        default=dataset_dir,
+        help="CIFAR-10 数据集在本地的根目录路径",
+    )
+    parser.add_argument(
+        "--path_cifar100",
+        type=str,
+        default=dataset_dir,
+        help="CIFAR-100 数据集在本地的根目录路径",
+    )
+    parser.add_argument(
+        "--path_svhn",
+        type=str,
+        default=os.path.join(dataset_dir, "SVHN"),
+        help="SVHN 数据集在本地的存储路径",
     )
     parser.add_argument(
         "--path_cinic10",
         type=str,
         default=os.path.join(dataset_dir, "cinic10_extracted"),
+        help="CINIC-10 解压后数据集在本地的存储路径",
     )
-
-    # ------------- 消融实验 -------------#
-    parser.add_argument(
-        "--SAGE_fixed_p",
-        default=0.5,
-        type=float,
-        help="Fixed parameter used in SAGE ablation study instead of dynamic adjustment",
-    )
-    parser.add_argument(
-        "--ablation_kappa",
-        default=2,
-        type=float,
-        help="Hyperparameter for controlling sensitivity of exponential decay in SAGE ablation study",
-    )
-
-    parser.add_argument("--seed", type=int, default=7)
-
-    # ------------- 基线方法 -------------#
-    # FedProx
-    parser.add_argument(
-        "--lambda_prox", default=0.001, type=float, help="coefficient of FedProx"
-    )
-    # FedLabel
-    parser.add_argument(
-        "--fedlabel_lambda", default=1, type=float, help="FedLabel Hyperparameter"
-    )
-
-    # FreeMatch
-    parser.add_argument(
-        "--freematch_sat_ema",
-        default=0.999,
-        type=float,
-        help="ema weight for FreeMatch SAT",
-    )
-    parser.add_argument(
-        "--sat_loss_ratio", default=1, type=float, help="Weight for FreeMatch SAT loss"
-    )
-    parser.add_argument(
-        "--saf_loss_ratio",
-        default=0.05,
-        type=float,
-        help="Weight for FreeMatch SAF loss",
-    )
-
-    # FedMatch
-    parser.add_argument("--fedmatch_confidence_threshold", type=float, default=0.75)
-    parser.add_argument("--fedmatch_lambda_s", default=10, type=float)
-    parser.add_argument("--fedmatch_lambda_iccs", default=0.01, type=float)
-    parser.add_argument("--fedmatch_lambda_l1", default=0.0001, type=float)
-    parser.add_argument("--fedmatch_lambda_l2", default=10, type=float)  # 10
-    parser.add_argument("--fedmatch_H", default=2, type=int)
-    parser.add_argument(
-        "--T", default=1, type=float, help="Temperature of pseudo-labeling"
-    )
-
-    parser.add_argument("--num_epochs_label_distillation", type=int, default=50)
-    parser.add_argument("--num_epochs_unlabel_distillation", type=int, default=50)
-    parser.add_argument("--batch_size_label_distillation", type=int, default=128)
-    parser.add_argument("--batch_size_unlabel_distillation", type=int, default=128)
-
-    parser.add_argument("--topk", type=float, default=0.2)
 
     args = parser.parse_args()
     return args

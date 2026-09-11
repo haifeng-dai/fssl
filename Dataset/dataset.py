@@ -84,7 +84,8 @@ class Indices2Dataset_labeled(Dataset):
     def __init__(self, dataset, repeat=2000):
         """创建有标签视图，并配置随机增强和归一化操作。"""
         self.dataset = dataset
-        self.indices = None
+        # 先使用空列表初始化，避免在 load() 前访问时出现 None 下标错误。
+        self.indices: list[int] = []
         self.repeat = repeat
         self.label_trans = transforms.Compose(
             [
@@ -121,7 +122,9 @@ class Indices2Dataset_unlabeled_fixmatch(Dataset):
     def __init__(self, dataset):
         """创建弱增强、强增强和归一化变换。"""
         self.dataset = dataset
-        self.indices = None
+        # 先使用空列表初始化，真正的客户端索引由 load() 填充。
+        self.indices: list[int] = []
+        self.client_dataset_len = 0
         self.weak = transforms.Compose(
             [
                 transforms.RandomHorizontalFlip(),
