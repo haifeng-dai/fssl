@@ -1,9 +1,13 @@
+import logging
+
 import numpy as np
 from PIL import Image
 from torch.utils.data.dataset import Dataset
 from torchvision import transforms
 
 from .randaugment import RandAugmentMC
+
+logger = logging.getLogger(__name__)
 
 
 def classify_label(dataset, num_classes: int):
@@ -35,6 +39,7 @@ def show_clients_data_distribution(
     """统计并打印每个客户端的有标签和无标签类别分布。"""
     dict_per_client_labeled = []
     dict_per_client_unlabeled = []
+    lines = []
 
     # 逐个客户端统计两类数据的标签数量。
     for client, indices in enumerate(
@@ -54,9 +59,12 @@ def show_clients_data_distribution(
             nums_data_unlabeled[label] += 1
         dict_per_client_unlabeled.append(nums_data_unlabeled)
 
-        print(f"client {client} labeled number per class : {nums_data_labeled}")
-        print(f"client {client} unlabeled number per class  : {nums_data_unlabeled}")
+        lines.append(
+            f"client {client} labeled number per class: {nums_data_labeled}\n"
+            f"client {client} unlabeled number per class: {nums_data_unlabeled}"
+        )
 
+    logger.info("\n".join(lines))
     return dict_per_client_labeled, dict_per_client_unlabeled
 
 

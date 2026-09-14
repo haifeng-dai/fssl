@@ -1,14 +1,8 @@
-import atexit
 import copy
-import dataclasses
-import json
 import logging
-import os
-import queue
 import random
 import sys
 import time
-import traceback
 
 import numpy as np
 import pandas as pd
@@ -24,9 +18,6 @@ from tqdm import tqdm
 
 from Dataset.CINIC10 import CINIC10
 from Dataset.dataset import (
-    Indices2Dataset_labeled,
-    Indices2Dataset_unlabeled_fixmatch,
-    SharedImageDataset,
     classify_label,
     partition_train,
     show_clients_data_distribution,
@@ -34,15 +25,49 @@ from Dataset.dataset import (
 from Dataset.sample_dirichlet import clients_indices, clients_indices_homo
 from Model.resnet import ResNet_PC
 from options import args_parser
+from utils.client_pool import (
+    ClientTask,
+    ClientWorkerPool,
+    parse_worker_gpus,
+    preload_shared_dataset,
+    run_main,
+)
+from utils.logging_setup import log_args, setup_logging
+from utils.run_registry import create_run
 
 logger = logging.getLogger(__name__)
 
 
-def l2_prototype_contrastive_loss(features, labels, anchors, temperature):
+def l2_prototype_contrastive_loss(features, labels, anchors):
     """L2 距离版 InfoNCE：标签类 anchor 为正对，其余 anchor 均为负对。"""
     negative_squared_distances = -torch.cdist(features, anchors, p=2).square()
-    logits = negative_squared_distances / temperature
+    logits = negative_squared_distances
     return F.cross_entropy(logits, labels)
+
+
+def prototype_probabilities(features, anchors):
+    """根据样本到全局 anchor 的负平方 L2 距离计算类别概率。"""
+    logits = -torch.cdist(features, anchors, p=2).square()
+    return torch.softmax(logits, dim=-1)
+
+
+def prototype_set_contrastive_loss(
+    features, positive_anchors, label_sets, unlabeled_start
+):
+    """标签集合对比：正对为 anchor/anchor 加权和，负对仅来自集合不相交样本。"""
+    positive_logits = -(features - positive_anchors).square().sum(dim=1)
+    pairwise_logits = -torch.cdist(features, features, p=2).square()
+
+    overlap = (label_sets.unsqueeze(1) & label_sets.unsqueeze(0)).any(dim=2)
+    negative_mask = ~overlap
+    negative_mask.fill_diagonal_(False)
+    negative_logits = pairwise_logits.masked_fill(~negative_mask, float("-inf"))
+
+    logits = torch.cat([positive_logits.unsqueeze(1), negative_logits], dim=1)
+    targets = torch.zeros(
+        logits.size(0) - unlabeled_start, dtype=torch.long, device=features.device
+    )
+    return F.cross_entropy(logits[unlabeled_start:], targets)
 
 
 class Global:
@@ -158,7 +183,6 @@ class Global:
                 local_prototypes,
                 local_labels,
                 anchor,
-                self.args.proto_temperature,
             )
             optimizer.zero_grad()
             loss.backward()
@@ -167,7 +191,7 @@ class Global:
 
 
 class Local:
-    """客户端训练器：本地/全局置信度联合筛选，使用全局教师伪标签。"""
+    """客户端训练器：本地/全局置信度联合筛选，使用全局模型伪标签。"""
 
     def __init__(self, args, device=None):
         self.device = device or torch.device(
@@ -185,8 +209,8 @@ class Local:
         )
         self.local_model.to(self.device)
 
-        # 与学生模型分离，避免本地更新改变本轮全局教师的预测。
-        self.global_teacher = ResNet_PC(
+        # 与局部模型分离为两份实例，避免本地更新改变本轮全局模型的预测。
+        self.global_model = ResNet_PC(
             resnet_size=8,
             scaling=4,
             save_activations=False,
@@ -195,7 +219,7 @@ class Local:
             freeze_bn_affine=False,
             num_classes=args.num_classes,
         )
-        self.global_teacher.to(self.device)
+        self.global_model.to(self.device)
 
         self.criterion = CrossEntropyLoss().to(self.device)
         self.optimizer = SGD(
@@ -214,8 +238,9 @@ class Local:
         data_client_unlabeled,
         global_params,
         global_anchors=None,
+        global_proto_conf=None,
     ):
-        """本地/全局置信度并集筛选，固定全局教师提供无标签目标。"""
+        """本地/全局置信度并集筛选，固定全局模型提供无标签目标。"""
         train_start = time.perf_counter()
         labeled_trainloader = DataLoader(
             dataset=data_client_labeled,
@@ -233,8 +258,8 @@ class Local:
 
         # 载入本轮最新的全局参数
         self.local_model.load_state_dict(global_params)
-        self.global_teacher.load_state_dict(global_params)
-        self.global_teacher.eval()
+        self.global_model.load_state_dict(global_params)
+        self.global_model.eval()
         # 彻底清空 SGD 动量，保证各客户端状态隔离
         self.optimizer.state.clear()
         self.local_model.train()
@@ -245,8 +270,23 @@ class Local:
         num_u_valid = 0
         pseudo_client_acc = 0.0
         u_client_valid = 0.0
-        # 每个本地 epoch 按无标签 DataLoader 的实际批次数训练。
-        local_iter = len(unlabeled_trainloader)
+        # 低置信样本统计：标签集大小直方图与真实标签命中率
+        # 直方图按大小直接索引（0 ~ num_classes），大小 0 表示无候选类；
+        # hit_hist 记录各大小桶内真实标签∈标签集的命中数
+        num_low_total = 0
+        num_gt_in_set_total = 0
+        set_size_hist = [0] * (args.num_classes + 1)
+        set_size_hit_hist = [0] * (args.num_classes + 1)
+        num_high_corrects = 0
+        # 原型置信度阈值统计：逐类累积 (有标签 + 高置信样本) 的原型概率。
+        conf_sum = torch.zeros(args.num_classes, device=self.device)
+        conf_cnt = torch.zeros(args.num_classes, device=self.device)
+        had_anchors = global_anchors is not None
+        # 与 ProxyFL 对齐：按有标签 batch 大小确定本地更新次数。
+        # 无标签 batch 为 B * mu，DataLoader 耗尽时会在下方循环重建。
+        local_iter = int(
+            len(data_client_unlabeled) / args.batch_size_local_labeled_fixmatch
+        )
 
         for local_epoch in range(args.local_epochs):
             labeled_iter = iter(labeled_trainloader)
@@ -294,14 +334,14 @@ class Local:
                     max_probs_local, _ = torch.max(probs_u_w_local, dim=-1)
                     mask_local = max_probs_local.ge(args.threshold)
 
-                    _, logits_u_w_global = self.global_teacher(inputs_u_w)
+                    _, logits_u_w_global = self.global_model(inputs_u_w)
                     probs_u_w_global = torch.softmax(logits_u_w_global / args.T, dim=-1)
                     max_probs_global, targets_u = torch.max(probs_u_w_global, dim=-1)
                     mask_global = max_probs_global.ge(args.threshold)
 
                     mask = torch.logical_or(mask_local, mask_global).float()
 
-                # 3. 无标签强增强的一致性 KL 损失，以全局教师硬伪标签为目标。
+                # 3. 无标签强增强的一致性 KL 损失，以全局模型硬伪标签为目标。
                 logits_u_s_probs = torch.softmax(logits_u_s, dim=-1).clamp_min(1e-10)
                 targets_u_one_hot = F.one_hot(
                     targets_u, num_classes=args.num_classes
@@ -315,25 +355,101 @@ class Local:
                     * mask
                 ).mean()
 
-                # 类别 anchor 是正样本，其余类别 anchor 都是负样本。
-                # 保持原有视图选择：有标签样本使用其特征，无标签样本仅使用弱增强且需通过 mask。
+                # 原型标签集合对比：低置信无标签样本使用弱增强原型概率生成候选集合。
+                # 集合阈值由服务器用上一轮各客户端（有标签 + 高置信样本）的平均
+                # 原型置信度下发；阈值未就绪时集合不生成、L_proto 为零，
+                # 但置信度统计照常进行，为服务器积累阈值估计。
                 L_proto = torch.zeros((), device=self.device)
+                low_sets = None
+                contrast_valid = None
                 if global_anchors is not None:
                     anchors = global_anchors.to(self.device)
-                    L_proto = l2_prototype_contrastive_loss(
-                        features_x, targets_x, anchors, args.proto_temperature
-                    )
                     features_u_w, _ = features[batch_size:].chunk(2)
-                    valid = mask.bool()
-                    if valid.any():
-                        L_proto = L_proto + l2_prototype_contrastive_loss(
-                            features_u_w[valid],
-                            targets_u[valid],
-                            anchors,
-                            args.proto_temperature,
+                    _, features_u_s = features[batch_size:].chunk(2)
+                    with torch.no_grad():
+                        proto_probs_u = prototype_probabilities(
+                            features_u_w.detach(), anchors
                         )
+                        proto_probs_x = prototype_probabilities(
+                            features_x.detach(), anchors
+                        )
+                        if global_proto_conf is not None:
+                            prior = torch.as_tensor(
+                                global_proto_conf,
+                                device=self.device,
+                                dtype=features.dtype,
+                            ).unsqueeze(0)
+                            low_sets = proto_probs_u > prior
+                            candidate_valid = low_sets.any(dim=1)
 
-                # 总损失：FixMatch 分类目标加上原型对比目标。
+                            high_sets = F.one_hot(
+                                targets_u, num_classes=args.num_classes
+                            ).bool()
+                            unlabeled_sets = torch.where(
+                                mask.bool().unsqueeze(1), high_sets, low_sets
+                            )
+                            low_positive = (proto_probs_u * low_sets).matmul(anchors)
+                            high_positive = anchors[targets_u]
+                            unlabeled_positive = torch.where(
+                                mask.bool().unsqueeze(1), high_positive, low_positive
+                            )
+                            contrast_valid = mask.bool() | candidate_valid
+
+                            labeled_sets = F.one_hot(
+                                targets_x, num_classes=args.num_classes
+                            ).bool()
+                            labeled_positive = anchors[targets_x]
+
+                    # 阈值统计：仅有标签样本与高置信无标签样本参与。
+                    # conf_sum[c] = 属于类 c 的可信样本对类 c 的原型概率之和。
+                    if local_epoch + 1 == args.local_epochs:
+                        one_hot_x = F.one_hot(targets_x, args.num_classes).float()
+                        conf_sum += (one_hot_x * proto_probs_x).sum(dim=0)
+                        conf_cnt += one_hot_x.sum(dim=0)
+                        valid = mask.bool()
+                        if valid.any():
+                            one_hot_u = F.one_hot(
+                                targets_u[valid], args.num_classes
+                            ).float()
+                            conf_sum += (one_hot_u * proto_probs_u[valid]).sum(dim=0)
+                            conf_cnt += one_hot_u.sum(dim=0)
+
+                    if contrast_valid is not None and contrast_valid.any():
+                        contrast_features = torch.cat(
+                            [
+                                features_x,
+                                features_u_w[contrast_valid],
+                                features_u_s[contrast_valid],
+                            ],
+                            dim=0,
+                        )
+                        contrast_positive = torch.cat(
+                            [
+                                labeled_positive,
+                                unlabeled_positive[contrast_valid],
+                                unlabeled_positive[contrast_valid],
+                            ],
+                            dim=0,
+                        )
+                        contrast_sets = torch.cat(
+                            [
+                                labeled_sets,
+                                unlabeled_sets[contrast_valid],
+                                unlabeled_sets[contrast_valid],
+                            ],
+                            dim=0,
+                        )
+                        # 原型校准损失（MSE 版本）：特征直接回归到目标 anchor。
+                        # 与集合对比 CE 不同，MSE 对有标签段也生效（真类 anchor）。
+                        L_proto = F.mse_loss(contrast_features, contrast_positive)
+                        # L_proto = prototype_set_contrastive_loss(
+                        #     contrast_features,
+                        #     contrast_positive,
+                        #     contrast_sets,
+                        #     unlabeled_start=batch_size,
+                        # )
+
+                # 总损失：FixMatch 分类目标加上原型标签集合对比目标。
                 loss = Lx + args.lambda_u * Lu + args.lambda_proto * L_proto
 
                 # 统计最后一个 epoch 的伪标签质量
@@ -345,6 +461,32 @@ class Local:
                     )
                     num_pseudo_total += len(targets_u)
                     num_u_valid += int(mask.sum().item())
+                    valid = mask.bool()
+                    if valid.any():
+                        num_high_corrects += (
+                            torch.eq(
+                                targets_u[valid].cpu(),
+                                targets_u_groundtruth[valid].cpu(),
+                            )
+                            .sum()
+                            .item()
+                        )
+
+                    # 低置信样本：候选标签集 = 弱增强原型概率 > 类别先验（需全局 anchor）
+                    low_mask = ~mask.bool()
+                    if low_mask.any():
+                        num_low_total += int(low_mask.sum().item())
+                        if low_sets is not None:
+                            low_sizes = low_sets.sum(dim=1)[low_mask]
+                            gt_hits = (
+                                low_sets[low_mask]
+                                .gather(1, targets_u_groundtruth[low_mask].unsqueeze(1))
+                                .squeeze(1)
+                            )
+                            for size, hit in zip(low_sizes.tolist(), gt_hits.tolist()):
+                                set_size_hist[int(size)] += 1
+                                set_size_hit_hist[int(size)] += int(hit)
+                            num_gt_in_set_total += int(gt_hits.sum().item())
 
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -358,16 +500,33 @@ class Local:
                     num_u_valid / num_pseudo_total if num_pseudo_total else 0.0
                 )
 
+        prototypes, prototype_counts = self.compute_prototypes(
+            args, data_client_labeled, data_client_unlabeled
+        )
+        proto_model_counts = self.prototype_model_eval(
+            args,
+            prototypes,
+            prototype_counts,
+            global_anchors,
+            data_client_labeled,
+            data_client_unlabeled,
+        )
+
         pseudo_status = [
             num_pseudo_total,
             num_pseudo_corrects,
             num_u_valid,
             pseudo_client_acc,
             u_client_valid,
+            num_low_total,
+            num_gt_in_set_total,
+            set_size_hist,
+            set_size_hit_hist,
+            conf_sum.tolist() if had_anchors else None,
+            conf_cnt.tolist() if had_anchors else None,
+            num_high_corrects,
+            proto_model_counts,
         ]
-        prototypes, prototype_counts = self.compute_prototypes(
-            args, data_client_labeled, data_client_unlabeled
-        )
         return (
             {
                 name: value.detach().cpu().clone()
@@ -381,7 +540,7 @@ class Local:
 
     @torch.no_grad()
     def compute_prototypes(self, args, labeled_dataset, unlabeled_dataset):
-        """用本地训练完成后的最终模型计算本地类别原型。"""
+        """用本地训练完成后的最终模型、仅基于有标签样本计算本地类别原型。"""
         self.local_model.eval()
         sums = torch.zeros(args.num_classes, self.local_model.dim, device=self.device)
         counts = torch.zeros(args.num_classes, device=self.device)
@@ -398,21 +557,81 @@ class Local:
                 if valid.any():
                     sums[c] += features[valid].sum(0)
                     counts[c] += valid.sum()
+        return (sums / counts.clamp_min(1).unsqueeze(1)).cpu(), counts.cpu()
+
+    @torch.no_grad()
+    def prototype_model_eval(
+        self,
+        args,
+        prototypes,
+        prototype_counts,
+        global_anchors,
+        labeled_dataset,
+        unlabeled_dataset,
+    ):
+        """本地/全局的原型最近邻与模型分类器，在本客户端数据上的准确率计数。
+
+        返回 20 元素列表（5 组 × [有标签命中, 有标签总数, 无标签命中, 无标签总数]）：
+        [0:4] 本地原型、[4:8] 本地模型、[8:12] 全局模型、[12:16] 全局原型(anchors)、
+        [16:20] 初始锚点分类（anchors × 训练前的全局模型特征）。
+        全局原型/初始锚点在第 1 轮缺失时总数为 0，显示层作 "—"。
+        本地无样本的类别（零向量原型）不参与本地原型最近邻。
+        """
+        self.local_model.eval()
+        local_proto = prototypes.to(self.device)
+        valid_proto = prototype_counts.to(self.device) > 0
+        counts = torch.zeros(20, device=self.device)
+        has_anchors = global_anchors is not None
+        anchors = global_anchors.to(self.device) if has_anchors else None
+
+        def nearest(features, centers, valid_mask=None):
+            distances = torch.cdist(features, centers)
+            if valid_mask is not None:
+                distances = distances.masked_fill(~valid_mask.unsqueeze(0), float("inf"))
+            return distances.argmin(dim=1)
+
+        loader = DataLoader(
+            # 训练视图包含 repeat=2000；评估对每个原始有标签样本算一次。
+            Subset(labeled_dataset, range(len(labeled_dataset.indices))),
+            args.batch_size_local_labeled_fixmatch,
+        )
+        for images, labels in loader:
+            images, labels = images.to(self.device), labels.to(self.device)
+            features, logits = self.local_model(images)
+            counts[0] += (nearest(features, local_proto, valid_proto) == labels).sum()
+            counts[1] += labels.numel()
+            counts[4] += (logits.argmax(dim=1) == labels).sum()
+            counts[5] += labels.numel()
+            global_feats, global_logits = self.global_model(images)
+            counts[8] += (global_logits.argmax(dim=1) == labels).sum()
+            counts[9] += labels.numel()
+            if has_anchors:
+                counts[12] += (nearest(features, anchors) == labels).sum()
+                counts[13] += labels.numel()
+                counts[16] += (nearest(global_feats, anchors) == labels).sum()
+                counts[17] += labels.numel()
+
         loader = DataLoader(
             unlabeled_dataset,
             args.batch_size_local_labeled_fixmatch,
             shuffle=False,
         )
-        for images, _, _ in loader:
-            images = images.to(self.device)
+        for images, _, labels in loader:
+            images, labels = images.to(self.device), labels.to(self.device)
             features, logits = self.local_model(images)
-            confidence, labels = torch.softmax(logits / args.T, -1).max(1)
-            for c in range(args.num_classes):
-                valid = (labels == c) & (confidence >= args.threshold)
-                if valid.any():
-                    sums[c] += features[valid].sum(0)
-                    counts[c] += valid.sum()
-        return (sums / counts.clamp_min(1).unsqueeze(1)).cpu(), counts.cpu()
+            counts[2] += (nearest(features, local_proto, valid_proto) == labels).sum()
+            counts[3] += labels.numel()
+            counts[6] += (logits.argmax(dim=1) == labels).sum()
+            counts[7] += labels.numel()
+            global_feats, global_logits = self.global_model(images)
+            counts[10] += (global_logits.argmax(dim=1) == labels).sum()
+            counts[11] += labels.numel()
+            if has_anchors:
+                counts[14] += (nearest(features, anchors) == labels).sum()
+                counts[15] += labels.numel()
+                counts[18] += (nearest(global_feats, anchors) == labels).sum()
+                counts[19] += labels.numel()
+        return counts.tolist()
 
     def interleave(self, x, size):
         """将有标签和无标签样本交错排列，以配合 BatchNorm 训练。"""
@@ -425,342 +644,45 @@ class Local:
         return x.reshape([size, -1] + s[1:]).transpose(0, 1).reshape([-1] + s[1:])
 
 
-@dataclasses.dataclass
-class ClientTask:
-    """主进程下发给客户端 Worker 的单次训练任务。"""
+class ClientTrainer:
+    """Worker 进程内的客户端训练适配器，供公共进程池调用。"""
 
-    round: int
-    client_id: int
-    labeled_indices: list[int]
-    unlabeled_indices: list[int]
-    global_params: dict[str, torch.Tensor]
-    global_anchors: torch.Tensor | None
-    args: object
+    def __init__(self, args, device):
+        self.local = Local(args, device=device)
 
-
-@dataclasses.dataclass
-class ClientResult:
-    """客户端 Worker 训练结束返回的结果对象。"""
-
-    ok: bool
-    client_id: int
-    gpu_id: int
-    params: dict[str, torch.Tensor] | None = None
-    num_samples: int = 0
-    pseudo_status: list[float] | None = None
-    prototypes: torch.Tensor | None = None
-    prototype_counts: torch.Tensor | None = None
-    elapsed_seconds: float = 0.0
-    error: str | None = None
-
-
-def preload_shared_dataset(dataset):
-    """一次性读取原始图片，并将图片和标签放入 CPU 共享内存。"""
-    first_image, _ = dataset[0]
-    first_image = np.asarray(first_image, dtype=np.uint8)
-    images = np.empty((len(dataset), *first_image.shape), dtype=np.uint8)
-    labels = np.empty(len(dataset), dtype=np.int64)
-
-    images[0] = first_image
-    labels[0] = dataset[0][1]
-    for index in range(1, len(dataset)):
-        image, label = dataset[index]
-        images[index] = np.asarray(image, dtype=np.uint8)
-        labels[index] = int(label)
-
-    shared_images = torch.from_numpy(images).share_memory_()
-    shared_labels = torch.from_numpy(labels).share_memory_()
-    logger.info(
-        "已将 %d 张原始图片加载到 CPU 共享内存，形状为 %s",
-        len(dataset),
-        tuple(shared_images.shape),
-    )
-    return SharedImageDataset(shared_images, shared_labels)
-
-
-def _client_worker(
-    gpu_id, args, shared_dataset, task_queue, result_queue, log_file=None
-):
-    """Worker 进程：在固定 GPU 上循环领取任务并执行客户端训练。"""
-    try:
-        # spawn 创建的子进程需要配置 logger，保证客户端训练日志正常输出
-        if log_file:
-            logging.basicConfig(
-                level=logging.INFO,
-                format="%(asctime)s - %(levelname)s - %(message)s",
-                filename=log_file,
-                force=True,
-            )
-
-        mp.set_sharing_strategy("file_system")
-        torch.cuda.set_device(gpu_id)
-        device = torch.device(f"cuda:{gpu_id}")
-        local = Local(args, device=device)
-
-        while True:
-            task = task_queue.get()
-            if task is None:
-                return
-
-            try:
-                seed = task.args.seed + task.round * 100_000 + task.client_id
-                random.seed(seed)
-                np.random.seed(seed)
-                torch.manual_seed(seed)
-                torch.cuda.manual_seed_all(seed)
-
-                labeled_view = Indices2Dataset_labeled(shared_dataset)
-                labeled_view.load(task.labeled_indices)
-                unlabeled_view = Indices2Dataset_unlabeled_fixmatch(shared_dataset)
-                unlabeled_view.load(task.unlabeled_indices)
-
-                (
-                    params,
-                    pseudo_status,
-                    prototypes,
-                    prototype_counts,
-                    elapsed_seconds,
-                ) = local.train(
-                    task.args,
-                    labeled_view,
-                    unlabeled_view,
-                    task.global_params,
-                    task.global_anchors,
-                )
-                result_queue.put(
-                    ClientResult(
-                        ok=True,
-                        client_id=task.client_id,
-                        gpu_id=gpu_id,
-                        params=params,
-                        num_samples=len(task.labeled_indices) * labeled_view.repeat
-                        + len(task.unlabeled_indices),
-                        pseudo_status=pseudo_status,
-                        prototypes=prototypes,
-                        prototype_counts=prototype_counts,
-                        elapsed_seconds=elapsed_seconds,
-                    )
-                )
-            except (
-                RuntimeError,
-                ValueError,
-                TypeError,
-                KeyError,
-                IndexError,
-                AttributeError,
-            ) as exc:
-                result_queue.put(
-                    ClientResult(
-                        ok=False,
-                        client_id=task.client_id,
-                        gpu_id=gpu_id,
-                        error=f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}",
-                    )
-                )
-    except (
-        RuntimeError,
-        ValueError,
-        TypeError,
-        KeyError,
-        IndexError,
-        AttributeError,
-        OSError,
-    ) as exc:
-        result_queue.put(
-            ClientResult(
-                ok=False,
-                client_id=-1,
-                gpu_id=gpu_id,
-                error=f"Worker initialization failed ({type(exc).__name__}: {exc}):\n{traceback.format_exc()}",
-            )
+    def train(self, task, labeled_view, unlabeled_view):
+        (
+            params,
+            pseudo_status,
+            prototypes,
+            prototype_counts,
+            elapsed_seconds,
+        ) = self.local.train(
+            task.args,
+            labeled_view,
+            unlabeled_view,
+            task.global_params,
+            task.global_anchors,
+            global_proto_conf=getattr(task.args, "global_proto_conf", None),
         )
-
-
-class ClientWorkerPool:
-    """管理客户端训练进程池，支持多卡/单卡多进程调度。"""
-
-    def __init__(self, gpu_ids, args, shared_dataset, log_file=None):
-        mp.set_sharing_strategy("file_system")
-        self.gpu_ids = list(gpu_ids)
-        self.args = copy.deepcopy(args)
-        self.ctx = mp.get_context("spawn")
-        self.task_queue = self.ctx.Queue()
-        self.result_queue = self.ctx.Queue()
-        self.processes = []
-        self.closed = False
-        atexit.register(self.terminate)
-
-        for gpu_id in self.gpu_ids:
-            process = self.ctx.Process(
-                target=_client_worker,
-                args=(
-                    gpu_id,
-                    copy.deepcopy(args),
-                    shared_dataset,
-                    self.task_queue,
-                    self.result_queue,
-                    log_file,
-                ),
-                name=f"fssl-client-gpu-{gpu_id}",
-            )
-            process.start()
-            self.processes.append(process)
-
-    def run_round(self, tasks):
-        """提交一轮客户端任务并收集按 client_id 排序后的结果。"""
-        tasks = list(tasks)
-        for task in tasks:
-            self.task_queue.put(task)
-
-        results = []
-        try:
-            for _ in tasks:
-                while True:
-                    try:
-                        result = self.result_queue.get(timeout=5)
-                        break
-                    except queue.Empty:
-                        dead = [
-                            process.name
-                            for process in self.processes
-                            if not process.is_alive()
-                        ]
-                        if dead:
-                            raise RuntimeError(
-                                "client worker exited without returning a result: "
-                                + ", ".join(dead)
-                            )
-                results.append(result)
-                if not result.ok:
-                    raise RuntimeError(
-                        f"client {result.client_id} failed on GPU {result.gpu_id}:\n"
-                        f"{result.error}"
-                    )
-        except Exception as exc:
-            round_id = tasks[0].round if tasks else -1
-            failure_dir = os.path.join(
-                "results", self.args.dataset, "parallel_failures"
-            )
-            os.makedirs(failure_dir, exist_ok=True)
-            failure_file = os.path.join(
-                failure_dir,
-                f"failure_round_{round_id}_{time.strftime('%Y%m%d_%H%M%S')}.json",
-            )
-            with open(failure_file, "w", encoding="utf8") as file:
-                json.dump(
-                    {
-                        "round": round_id,
-                        "error": str(exc),
-                        "tasks": [task.client_id for task in tasks],
-                        "args": vars(self.args),
-                    },
-                    file,
-                    ensure_ascii=False,
-                    indent=2,
-                )
-            self.terminate()
-            raise
-
-        return sorted(results, key=lambda result: result.client_id)
-
-    def close(self):
-        """发送退出信号并回收所有 Worker。"""
-        if self.closed:
-            return
-        for _ in self.processes:
-            self.task_queue.put(None)
-        for process in self.processes:
-            process.join()
-        self.closed = True
-
-    def terminate(self):
-        """强制终止 Worker 进程。"""
-        if self.closed:
-            return
-        for process in self.processes:
-            if process.is_alive():
-                process.terminate()
-        for process in self.processes:
-            process.join()
-        self.closed = True
-
-
-def _parse_worker_gpus(args):
-    """解析 GPU 和进程数配置。"""
-    if args.client_gpus:
-        try:
-            gpu_ids = [int(value.strip()) for value in args.client_gpus.split(",")]
-        except ValueError as exc:
-            raise ValueError("--client_gpus 必须是逗号分隔的 GPU 整数列表") from exc
-        if not gpu_ids or len(set(gpu_ids)) != len(gpu_ids):
-            raise ValueError("--client_gpus 至少需要包含一个不重复的 GPU 编号")
-    else:
-        gpu_ids = [args.gpu_id]
-
-    if not torch.cuda.is_available():
-        raise RuntimeError("多 GPU 训练需要可用的 CUDA 环境")
-
-    device_count = torch.cuda.device_count()
-    invalid = [gpu_id for gpu_id in gpu_ids if gpu_id < 0 or gpu_id >= device_count]
-    if invalid:
-        raise ValueError(
-            f"GPU 编号 {invalid} 不可用；当前可见 GPU 数量为 {device_count}"
-        )
-
-    args.server_gpu = args.server_gpu if args.server_gpu is not None else gpu_ids[0]
-    if args.server_gpu < 0 or args.server_gpu >= device_count:
-        raise ValueError(f"--server_gpu {args.server_gpu} 超出可用 GPU 范围")
-
-    if args.gpu_processes:
-        process_counts = {}
-        try:
-            for item in args.gpu_processes.split(","):
-                gpu_text, count_text = item.split(":", 1)
-                gpu_id, count = int(gpu_text), int(count_text)
-                if count < 1 or gpu_id in process_counts:
-                    raise ValueError
-                process_counts[gpu_id] = count
-        except ValueError as exc:
-            raise ValueError(
-                "--gpu_processes 格式必须为 GPU:进程数，例如 0:2,1:1"
-            ) from exc
-        if set(process_counts) != set(gpu_ids):
-            raise ValueError(
-                "--gpu_processes 必须为每个 --client_gpus 中的 GPU 指定进程数"
-            )
-    else:
-        process_counts = {gpu_id: 1 for gpu_id in gpu_ids}
-        if args.max_parallel_clients is not None:
-            if args.max_parallel_clients < 1:
-                raise ValueError("--max_parallel_clients 必须大于 0")
-            gpu_ids = gpu_ids[: args.max_parallel_clients]
-            process_counts = {gpu_id: 1 for gpu_id in gpu_ids}
-
-    return [gpu_id for gpu_id in gpu_ids for _ in range(process_counts[gpu_id])]
+        return {
+            "params": params,
+            "pseudo_status": pseudo_status,
+            "prototypes": prototypes,
+            "prototype_counts": prototype_counts,
+            "elapsed_seconds": elapsed_seconds,
+        }
 
 
 def fedavg_fixmatch(alpha, args=None):
     """执行纯净的联邦半监督学习 (FedAvg + FixMatch)。"""
     if args is None:
         args = args_parser()
-    args.method = "FedAvg_FixMatch"
-
-    log_dir = f"./results/{args.dataset}/logs"
-    os.makedirs(log_dir, exist_ok=True)
-    cr_time = time.strftime("%Y-%m-%d_%H:%M:%S", time.localtime())
-    log_file = os.path.join(log_dir, f"{args.method}_α={alpha}_{cr_time}.log")
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(message)s",
-        filename=log_file,
-        force=True,
-    )
+    args.method = "test"
 
     if args.dataset == "CIFAR10":
         args.num_classes = 10
         args.num_labeled = 500
-        args.num_rounds = 300
         transform_test = transforms.Compose(
             [
                 transforms.ToTensor(),
@@ -779,7 +701,6 @@ def fedavg_fixmatch(alpha, args=None):
     elif args.dataset == "CIFAR100":
         args.num_classes = 100
         args.num_labeled = 50
-        args.num_rounds = 500
         transform_test = transforms.Compose(
             [
                 transforms.ToTensor(),
@@ -798,7 +719,6 @@ def fedavg_fixmatch(alpha, args=None):
     elif args.dataset == "SVHN":
         args.num_classes = 10
         args.num_labeled = 460
-        args.num_rounds = 150
         transform_test = transforms.Compose(
             [
                 transforms.ToTensor(),
@@ -817,7 +737,6 @@ def fedavg_fixmatch(alpha, args=None):
     elif args.dataset == "CINIC10":
         args.num_classes = 10
         args.num_labeled = 900
-        args.num_rounds = 400
         transform_test = transforms.Compose(
             [
                 transforms.ToTensor(),
@@ -832,19 +751,15 @@ def fedavg_fixmatch(alpha, args=None):
         )
 
     else:
-        print(f"Error: Unsupported dataset {args.dataset}.")
+        logger.error("不支持的数据集：%s", args.dataset)
         sys.exit(1)
 
-    logger.info(
-        f"dataset:{args.dataset}\n"
-        f"num_classes:{args.num_classes}\n"
-        f"num_labeled:{args.num_labeled}\n"
-        f"non_iid:{args.alpha}\n"
-        f"mu:{args.mu}\n"
-        f"num_rounds:{args.num_rounds}\n"
-        f"batch_labeled:{args.batch_size_local_labeled_fixmatch}\n"
-        f"batch_unlabeled:{args.batch_size_local_labeled_fixmatch * args.mu}"
-    )
+    # ==================== 注册实验运行（唯一目录 + SQLite 索引） ====================
+    run = create_run(args)
+    setup_logging(run.log_file, level=args.log_level)
+    logger.info("运行 ID：%s，结果目录：%s", run.run_id, run.dir)
+
+    log_args(args)
 
     random_state = np.random.RandomState(args.seed)
     list_label2indices = classify_label(data_local_training, args.num_classes)
@@ -869,14 +784,14 @@ def fedavg_fixmatch(alpha, args=None):
             num_classes=args.num_classes,
             num_clients=args.num_clients,
             non_iid_alpha=alpha,
-            seed=0,
+            seed=args.seed,
         )
         list_client2indices_unlabeled = clients_indices(
             list_label2indices=list_label2indices_unlabeled,
             num_classes=args.num_classes,
             num_clients=args.num_clients,
             non_iid_alpha=alpha,
-            seed=0,
+            seed=args.seed,
         )
 
     show_clients_data_distribution(
@@ -894,13 +809,19 @@ def fedavg_fixmatch(alpha, args=None):
             ]
         )
 
-    client_gpus = _parse_worker_gpus(args)
+    client_gpus = parse_worker_gpus(args)
     args.gpu_id = args.server_gpu
     global_model = Global(args)
 
     mp.set_sharing_strategy("file_system")
     shared_dataset = preload_shared_dataset(data_local_training)
-    worker_pool = ClientWorkerPool(client_gpus, args, shared_dataset, log_file=log_file)
+    worker_pool = ClientWorkerPool(
+        client_gpus,
+        args,
+        shared_dataset,
+        trainer_cls=ClientTrainer,
+        log_file=str(run.log_file),
+    )
 
     total_clients = list(range(args.num_clients))
 
@@ -911,9 +832,14 @@ def fedavg_fixmatch(alpha, args=None):
     # 第一轮尚未有服务器端原型，聚合时作为 previous 传入 None。
     global_prototypes = None
     global_anchors = None
+    # 全局原型置信度阈值：由服务器跨客户端平均（有标签 + 高置信样本）得到，
+    # 首轮未就绪时为 None，客户端不生成候选集合。
+    global_proto_conf = None
+    args.global_proto_conf = None
 
-    progress = tqdm(range(1, args.num_rounds + 1), desc="Test")
+    progress = tqdm(range(1, args.num_rounds + 1), desc=args.method)
     for r in progress:
+        logger.info("========== 第 %d 轮 ==========", r)
         dict_global_params = global_model.download_params()
         online_clients = random_state.choice(
             total_clients, args.num_online_clients, replace=False
@@ -956,12 +882,188 @@ def fedavg_fixmatch(alpha, args=None):
             [result.prototype_counts for result in results],
             global_prototypes,
         )
+        sum_proto_counts = torch.stack(
+            [result.prototype_counts for result in results]
+        ).sum(dim=0)
+        logger.info(
+            "第 %d 轮：全局原型与 anchor 已更新，本轮 %d/%d 个类别有原型覆盖",
+            r,
+            int((sum_proto_counts > 0).sum()),
+            len(sum_proto_counts),
+        )
 
         for result in results:
             pseudo_status = result.pseudo_status
             num_clients_u_total += pseudo_status[0]
             num_clients_u_corrects += pseudo_status[1]
             num_clients_u_valid += pseudo_status[2]
+
+        # ==================== 全局原型置信度阈值（跨客户端加权平均） ====================
+        conf_sum_total = None
+        conf_cnt_total = None
+        for result in results:
+            client_conf_sum, client_conf_cnt = (
+                result.pseudo_status[9],
+                result.pseudo_status[10],
+            )
+            if client_conf_sum is None:
+                continue
+            client_sum = torch.tensor(client_conf_sum)
+            client_cnt = torch.tensor(client_conf_cnt)
+            conf_sum_total = (
+                client_sum if conf_sum_total is None else conf_sum_total + client_sum
+            )
+            conf_cnt_total = (
+                client_cnt if conf_cnt_total is None else conf_cnt_total + client_cnt
+            )
+        if conf_sum_total is not None:
+            # count=0 的类相除得到 NaN，proto_probs > NaN 恒为 False，
+            # 该类在取得证据前自然不进入候选集。
+            global_proto_conf = (conf_sum_total / conf_cnt_total).tolist()
+            args.global_proto_conf = global_proto_conf
+            logger.info(
+                "全局原型置信度阈值：%s",
+                np.round(np.asarray(global_proto_conf), 4),
+            )
+
+        # ==================== 伪标签与标签集统计（拼接为一条 DEBUG） ====================
+        sum_total = sum_valid = sum_low = sum_gt_in_set = 0
+        sum_high_corrects = 0
+        sum_hist = None
+        sum_hit_hist = None
+        proto_model_total = [0] * 20
+        lines = []
+
+        def format_counts(hist, low_total):
+            """标签集大小段的每桶计数与占低置信样本比例。"""
+            parts = []
+            for size, count in enumerate(hist):
+                if not count:
+                    continue
+                if size == 0:
+                    # 空标签集：一个候选类都没有
+                    parts.append(f"0(空集): {count}(占{count / low_total:.1%})")
+                else:
+                    parts.append(f"{size}: {count}(占{count / low_total:.1%})")
+            return "{" + ", ".join(parts) + "}" if parts else "空"
+
+        def format_eval_pair(counts, offset):
+            """原型/模型分类段的半边：有标签与无标签两个准确率。"""
+            parts = []
+            for offset_base, name in ((offset, "有标签"), (offset + 2, "无标签")):
+                hit, total = int(counts[offset_base]), int(counts[offset_base + 1])
+                parts.append(
+                    f"{name} {hit / total:.1%}({hit}/{total})" if total else f"{name} —"
+                )
+            return f"[{', '.join(parts)}]"
+
+        def format_acc(hist, hit_hist):
+            """准确率段的逐桶命中率；零命中的桶（如空集合）不显示。"""
+            parts = [
+                f"{size}: {hit_hist[size] / count:.1%}({hit_hist[size]}/{count})"
+                for size, count in enumerate(hist)
+                if count and hit_hist[size]
+            ]
+            return "{" + ", ".join(parts) + "}" if parts else "空"
+
+        for result in results:
+            status = result.pseudo_status
+            num_total, num_valid = status[0], status[2]
+            num_low, num_gt_in_set, hist, hit_hist = (
+                status[5],
+                status[6],
+                status[7],
+                status[8],
+            )
+            num_high_corrects = status[11]
+            proto_model_counts = status[12]
+            for idx, value in enumerate(proto_model_counts):
+                proto_model_total[idx] += value
+            sum_total += num_total
+            sum_valid += num_valid
+            sum_low += num_low
+            sum_gt_in_set += num_gt_in_set
+            sum_high_corrects += num_high_corrects
+            if sum_hist is None:
+                sum_hist = list(hist)
+                sum_hit_hist = list(hit_hist)
+            else:
+                sum_hist = [a + b for a, b in zip(sum_hist, hist)]
+                sum_hit_hist = [a + b for a, b in zip(sum_hit_hist, hit_hist)]
+
+            valid_part = (
+                f"{num_valid / num_total:.1%}({num_valid}/{num_total})"
+                if num_total
+                else "0.0%(0/0)"
+            )
+            high_acc_part = (
+                f"{num_high_corrects / num_valid:.1%}({num_high_corrects}/{num_valid})"
+                if num_valid
+                else "—"
+            )
+            if num_low:
+                hit_part = f"{num_gt_in_set / num_low:.1%}({num_gt_in_set}/{num_low})"
+                if any(hist):
+                    acc_part = format_acc(hist, hit_hist)
+                    set_part = format_counts(hist, num_low)
+                else:
+                    # anchor 或阈值未就绪，本轮未生成候选集合
+                    acc_part = "无集合"
+                    set_part = "无集合"
+            else:
+                set_part = "无低置信样本"
+                acc_part = "—"
+                hit_part = "—"
+            lines.append(
+                f"客户端 {result.client_id}：高置信 {valid_part}｜"
+                f"高置信伪标签准确率 {high_acc_part}｜"
+                f"低置信标签集大小 {set_part}｜真实标签∈标签集 {acc_part}｜整体 {hit_part}"
+            )
+            lines.append(
+                f"客户端 {result.client_id}：本地原型分类 {format_eval_pair(proto_model_counts, 0)}｜"
+                f"本地模型分类 {format_eval_pair(proto_model_counts, 4)}｜"
+                f"全局模型分类 {format_eval_pair(proto_model_counts, 8)}｜"
+                f"全局原型分类 {format_eval_pair(proto_model_counts, 12)}｜"
+                f"初始锚点分类 {format_eval_pair(proto_model_counts, 16)}"
+            )
+        total_valid_part = (
+            f"{sum_valid / sum_total:.1%}({sum_valid}/{sum_total})"
+            if sum_total
+            else "0.0%(0/0)"
+        )
+        total_high_acc_part = (
+            f"{sum_high_corrects / sum_valid:.1%}({sum_high_corrects}/{sum_valid})"
+            if sum_valid
+            else "—"
+        )
+        total_hit_part = (
+            f"{sum_gt_in_set / sum_low:.1%}({sum_gt_in_set}/{sum_low})"
+            if sum_low
+            else "—"
+        )
+        total_set_part = (
+            format_counts(sum_hist, sum_low)
+            if sum_low and any(sum_hist)
+            else ("无低置信样本" if not sum_low else "无集合")
+        )
+        total_acc_part = (
+            format_acc(sum_hist, sum_hit_hist)
+            if sum_low and any(sum_hist)
+            else ("无低置信样本" if not sum_low else "无集合")
+        )
+        lines.append(
+            f"第 {r} 轮合计：高置信 {total_valid_part}｜"
+            f"高置信伪标签准确率 {total_high_acc_part}｜"
+            f"低置信标签集大小 {total_set_part}｜真实标签∈标签集 {total_acc_part}｜整体 {total_hit_part}"
+        )
+        lines.append(
+            f"第 {r} 轮合计：本地原型分类 {format_eval_pair(proto_model_total, 0)}｜"
+            f"本地模型分类 {format_eval_pair(proto_model_total, 4)}｜"
+            f"全局模型分类 {format_eval_pair(proto_model_total, 8)}｜"
+            f"全局原型分类 {format_eval_pair(proto_model_total, 12)}｜"
+            f"初始锚点分类 {format_eval_pair(proto_model_total, 16)}"
+        )
+        logger.debug("第 %d 轮伪标签统计：\n%s", r, "\n".join(lines))
 
         pseudo_acc = (
             num_clients_u_corrects / num_clients_u_total if num_clients_u_total else 0.0
@@ -983,13 +1085,11 @@ def fedavg_fixmatch(alpha, args=None):
             copy.deepcopy(fedavg_params), data_global_test, args.batch_size_test
         )
         fedavg_acc.append(global_acc)
+        logger.info("第 %d 轮全局模型精度：%.2f%%", r, global_acc * 100)
 
         progress.set_postfix(acc=f"{global_acc:.2%}")
 
-        result_dir = f"./results/{args.dataset}"
-        os.makedirs(result_dir, exist_ok=True)
-        result_dir_spec = f"{result_dir}/{args.method}_α={alpha}_{cr_time}"
-        os.makedirs(result_dir_spec, exist_ok=True)
+        result_dir_spec = run.checkpoint_dir
 
         if (
             r == 1
@@ -997,17 +1097,14 @@ def fedavg_fixmatch(alpha, args=None):
             or (r % 50 == 0 and r > 0.8 * args.num_rounds)
         ):
             torch.save(fedavg_params, f"{result_dir_spec}/fedavg_params_round_{r}.pth")
-            print(f"Saved model for round {r}")
 
-        result_file = f"{result_dir}/{args.method}_α={alpha}_{cr_time}.csv"
+        result_file = run.dir / "metrics.csv"
         acc_df = pd.DataFrame(
             {"acc": fedavg_acc}, index=list(range(1, len(fedavg_acc) + 1))
         )
         acc_df.to_csv(result_file, encoding="utf8")
 
-        result_pseudo_file = (
-            f"{result_dir}/{args.method}_α={alpha}_pseudo_{cr_time}.csv"
-        )
+        result_pseudo_file = run.dir / "pseudo_metrics.csv"
         min_length = min(
             len(fedavg_pseudo_acc),
             len(fedavg_valid_ratio),
@@ -1027,6 +1124,9 @@ def fedavg_fixmatch(alpha, args=None):
         metrics_df.to_csv(result_pseudo_file, encoding="utf8")
 
     worker_pool.close()
+    run.finish(
+        best_acc=max(fedavg_acc) if fedavg_acc else None, num_rounds=args.num_rounds
+    )
 
 
 if __name__ == "__main__":
@@ -1039,4 +1139,4 @@ if __name__ == "__main__":
     torch.backends.cudnn.deterministic = False
     torch.backends.cudnn.benchmark = True
 
-    fedavg_fixmatch(args.alpha, args)
+    run_main(lambda: fedavg_fixmatch(args.alpha, args))

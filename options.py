@@ -12,12 +12,6 @@ def args_parser():
     # 1. 基础实验与联邦拓扑参数 (Federated Learning & Basic Config)
     # =========================================================================
     parser.add_argument(
-        "--method",
-        type=str,
-        default="ProxyFL",
-        help="训练方法/算法标识名称 (保存路径与日志命名前缀)",
-    )
-    parser.add_argument(
         "--dataset",
         type=str,
         default="CIFAR10",
@@ -46,6 +40,18 @@ def args_parser():
         type=int,
         default=42,
         help="全局随机数种子，用于数据划分与网络初始化复现",
+    )
+    parser.add_argument(
+        "--num_rounds",
+        type=int,
+        default=300,
+        help="联邦训练总通信轮数 (各数据集推荐值: CIFAR10=300, CIFAR100=500, SVHN=150, CINIC10=400)",
+    )
+    parser.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        help="同配置实验的第几次重复：绘图时同一配置跨编号聚合均值/方差；同编号重跑只取最新一次",
     )
 
     # =========================================================================
@@ -125,19 +131,13 @@ def args_parser():
         "--lambda_u",
         type=float,
         default=1.0,
-        help="客户端损失函数中无标签损失 (Lu) 与代理对比损失 (Lc) 的加权系数",
+        help="客户端无标签 KL 一致性损失 (Lu) 的权重",
     )
     parser.add_argument(
         "--lambda_proto",
         type=float,
         default=1.0,
-        help="客户端原型对比损失权重",
-    )
-    parser.add_argument(
-        "--proto_temperature",
-        type=float,
-        default=0.1,
-        help="样本-原型 InfoNCE 对比损失的温度系数",
+        help="客户端原型标签集合对比损失权重",
     )
     parser.add_argument(
         "--T",
@@ -156,16 +156,10 @@ def args_parser():
         help="服务端代理网络 (GPT 分类头) 的优化学习率 (eta_s)",
     )
     parser.add_argument(
-        "--total_server_epochs",
-        type=int,
-        default=30000,
-        help="整个联邦训练全流程中服务端代理网络累计优化的总 epoch 轮数 (用于计算每轮轮数与实验命名)",
-    )
-    parser.add_argument(
         "--server_epochs",
         type=int,
         default=100,
-        help="服务端每轮通信中代理网络优化的目标轮数 (若代码自动计算则作为基准参考)",
+        help="服务端每轮通信中代理网络优化的 epoch 数",
     )
     parser.add_argument(
         "--bs_server",
@@ -220,16 +214,17 @@ def args_parser():
         help="服务端全局锚点学习率",
     )
     parser.add_argument(
-        "--anchor_margin",
-        type=float,
-        default=1.0,
-        help="锚点 L2 对比学习的负样本距离间隔",
-    )
-    parser.add_argument(
         "--anchor_steps",
         type=int,
         default=20,
         help="每轮服务端全局锚点优化步数",
+    )
+    parser.add_argument(
+        "--log_level",
+        type=str,
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="日志级别（命令行可指定，仅控制本项目日志，第三方库始终压制到 WARNING+）",
     )
 
     args = parser.parse_args()

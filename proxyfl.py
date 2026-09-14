@@ -1,14 +1,7 @@
-import atexit
 import copy
-import dataclasses
-import json
 import logging
-import os
-import queue
 import random
 import sys
-import time
-import traceback
 
 import numpy as np
 import pandas as pd
@@ -25,9 +18,6 @@ from tqdm import tqdm
 
 from Dataset.CINIC10 import CINIC10
 from Dataset.dataset import (
-    Indices2Dataset_labeled,
-    Indices2Dataset_unlabeled_fixmatch,
-    SharedImageDataset,
     classify_label,
     partition_train,
     show_clients_data_distribution,
@@ -35,6 +25,15 @@ from Dataset.dataset import (
 from Dataset.sample_dirichlet import clients_indices, clients_indices_homo
 from Model.resnet import ResNet_PC
 from options import args_parser
+from utils.client_pool import (
+    ClientTask,
+    ClientWorkerPool,
+    parse_worker_gpus,
+    preload_shared_dataset,
+    run_main,
+)
+from utils.logging_setup import log_args, setup_logging
+from utils.run_registry import create_run
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +66,7 @@ class Global:
         self.GPT.to(self.device)
         self.GPT_opt = SGD(self.GPT.parameters(), lr=args.lr_server)
 
-        self.server_epochs = args.total_server_epochs // args.num_rounds
+        self.server_epochs = args.server_epochs
         self.ema_beta = 0.99
 
     def initialize_for_model_fusion(
@@ -102,9 +101,7 @@ class Global:
             if full_param_name in fedavg_global_params:
                 fedavg_global_params[full_param_name] = param.detach().cpu().clone()
             else:
-                logger.warning(
-                    f"Parameter {full_param_name} not found in global params"
-                )
+                logger.warning("参数 %s 不在全局参数中", full_param_name)
 
         all_classifier_weights = []
         # 遍历每个客户端的参数
@@ -220,7 +217,7 @@ class Global:
         输出: 经过 EMA 平滑后的全局分布 (numpy array)
         """
         if current_global_dist is None:
-            logger.info("Initialized Global EMA Distribution.")
+            logger.info("已初始化全局 EMA 类别分布。")
             return np.ones(self.num_classes) / self.num_classes
 
         # 1. 计算本轮的实时类别分布
@@ -233,19 +230,22 @@ class Global:
             return current_global_dist
 
         current_round_dist = total_counts / total_sum
-        current_global_dist = (
+        updated_dist = (
             self.ema_beta * current_global_dist
             + (1 - self.ema_beta) * current_round_dist
         )
 
-        logger.info(f"Current Round Dist: {current_round_dist}")
-        logger.info(f"Updated EMA Global Dist: {current_global_dist}")
+        logger.debug(
+            "类别分布：\n当前轮：%s\n更新后的 EMA 全局：%s",
+            np.round(current_round_dist, 4),
+            np.round(updated_dist, 4),
+        )
 
-        return current_global_dist
+        return updated_dist
 
 
 class Local:
-    """客户端训练器，封装本地模型、教师模型、优化器和 FixMatch 损失。"""
+    """客户端训练器，封装全局模型、局部模型、优化器和 FixMatch 损失。"""
 
     def __init__(self, args, device=None):
         """在指定设备上创建客户端训练所需的两个模型。"""
@@ -292,8 +292,6 @@ class Local:
         data_client_labeled,
         data_client_unlabeled,
         global_params,
-        r,
-        client_idx,
         global_class_dist=None,
     ):
         """使用当前全局参数执行一次客户端本地训练并返回结果。"""
@@ -326,6 +324,15 @@ class Local:
         num_pseudo_corrects = 0
         num_pseudo_total = 0
         num_u_valid = 0
+        # 高置信子集的伪标签正确数（仅统计 mask_valid 选中的样本）
+        num_high_corrects = 0
+        # 低置信样本统计：标签集大小直方图与真实标签命中率
+        # 直方图按大小直接索引（0 ~ num_classes），大小 0 表示无候选类；
+        # hit_hist 记录各大小桶内真实标签∈标签集的命中数
+        num_low_total = 0
+        num_gt_in_set_total = 0
+        set_size_hist = [0] * (args.num_classes + 1)
+        set_size_hit_hist = [0] * (args.num_classes + 1)
         pseudo_client_acc = 0.0
         u_client_valid = 0.0
 
@@ -359,9 +366,7 @@ class Local:
                 inputs_u_w = inputs_u_w.to(self.device)
                 inputs_u_s = inputs_u_s.to(self.device)
                 targets_x = targets_x.to(self.device)
-                targets_u_groundtruth = targets_u_groundtruth.to(
-                    self.device
-                )
+                targets_u_groundtruth = targets_u_groundtruth.to(self.device)
 
                 batch_size = inputs_x.shape[0]
                 inputs = self.interleave(
@@ -476,6 +481,45 @@ class Local:
                     )
                     num_pseudo_total += len(targets_u_global)
                     num_u_valid += int(mask_valid.sum().item())
+                    if mask_valid.sum() > 0:
+                        valid_idx = mask_valid.bool()
+                        num_high_corrects += (
+                            torch.eq(
+                                targets_u_global[valid_idx].cpu(),
+                                targets_u_groundtruth[valid_idx].cpu(),
+                            )
+                            .sum()
+                            .item()
+                        )
+
+                    # 低置信样本：候选标签集 = 全局概率 > 类别先验（与 ICPL 的 sets_class 同构）
+                    low_mask = ~mask_valid.bool()
+                    if low_mask.any():
+                        if global_class_dist is None:
+                            prior_u = torch.full(
+                                (1, args.num_classes),
+                                1.0 / args.num_classes,
+                                device=probs_u_w_glob.device,
+                                dtype=probs_u_w_glob.dtype,
+                            )
+                        else:
+                            prior_u = torch.as_tensor(
+                                global_class_dist,
+                                device=probs_u_w_glob.device,
+                                dtype=probs_u_w_glob.dtype,
+                            ).unsqueeze(0)
+                        sets_u = pseudo_label_global > prior_u
+                        low_sizes = sets_u.sum(dim=1)[low_mask]
+                        gt_hits = (
+                            sets_u[low_mask]
+                            .gather(1, targets_u_groundtruth[low_mask].unsqueeze(1))
+                            .squeeze(1)
+                        )
+                        for size, hit in zip(low_sizes.tolist(), gt_hits.tolist()):
+                            set_size_hist[int(size)] += 1
+                            set_size_hit_hist[int(size)] += int(hit)
+                        num_gt_in_set_total += int(gt_hits.sum().item())
+                        num_low_total += int(low_mask.sum().item())
 
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -490,6 +534,7 @@ class Local:
                     num_u_valid / num_pseudo_total if num_pseudo_total else 0.0
                 )
 
+        model_counts = self.model_eval(args, data_client_labeled, data_client_unlabeled)
 
         pseudo_status = [
             num_pseudo_total,
@@ -497,6 +542,12 @@ class Local:
             num_u_valid,
             pseudo_client_acc,
             u_client_valid,
+            num_low_total,
+            num_gt_in_set_total,
+            set_size_hist,
+            set_size_hit_hist,
+            num_high_corrects,
+            model_counts,
         ]
         return (
             {
@@ -506,6 +557,39 @@ class Local:
             pseudo_status,
             local_class_counts.cpu().numpy(),
         )
+
+    @torch.no_grad()
+    def model_eval(self, args, labeled_dataset, unlabeled_dataset):
+        """本地模型与冻结全局模型(local_G)在本地数据上的分类准确率计数。
+
+        训练全部结束后仅调用一次；batch 只是本次评估遍历的分批机制。
+        返回 8 元素列表（4 组 × [命中, 总数] × 有标签/无标签）：
+        [0:2] 本地模型有标签、[2:4] 本地模型无标签、
+        [4:6] 全局模型有标签、[6:8] 全局模型无标签。
+        """
+        self.local_model.eval()
+        counts = torch.zeros(8, device=self.device)
+        loader = DataLoader(labeled_dataset, args.batch_size_local_labeled_fixmatch)
+        for images, labels in loader:
+            images, labels = images.to(self.device), labels.to(self.device)
+            _, logits = self.local_model(images)
+            _, logits_glob = self.local_G(images)
+            counts[0] += (logits.argmax(dim=1) == labels).sum()
+            counts[1] += labels.numel()
+            counts[4] += (logits_glob.argmax(dim=1) == labels).sum()
+            counts[5] += labels.numel()
+        loader = DataLoader(unlabeled_dataset, args.batch_size_local_labeled_fixmatch)
+        for images_u_w, _, labels in loader:
+            # 无标签视图无独立基视图，评估用弱增强图（与掩码预测同源）。
+            images_u_w = images_u_w.to(self.device)
+            labels = labels.to(self.device)
+            _, logits = self.local_model(images_u_w)
+            _, logits_glob = self.local_G(images_u_w)
+            counts[2] += (logits.argmax(dim=1) == labels).sum()
+            counts[3] += labels.numel()
+            counts[6] += (logits_glob.argmax(dim=1) == labels).sum()
+            counts[7] += labels.numel()
+        return counts.tolist()
 
     def ICPL(self, feature, projs_prob, conf_mask, prior_distribution, conf_x_num=None):
         """计算基于代理相似度、类别先验和置信度掩码的 ICPL 损失。"""
@@ -582,302 +666,25 @@ class Local:
         return x.reshape([size, -1] + s[1:]).transpose(0, 1).reshape([-1] + s[1:])
 
 
-@dataclasses.dataclass
-class ClientTask:
-    """主进程发送给客户端 Worker 的一轮训练任务。"""
+class ClientTrainer:
+    """Worker 进程内的客户端训练适配器，供公共进程池调用。"""
 
-    round: int
-    client_id: int
-    labeled_indices: list
-    unlabeled_indices: list
-    global_params: dict
-    global_class_dist: np.ndarray | None
-    args: object
+    def __init__(self, args, device):
+        self.local = Local(args, device=device)
 
-
-@dataclasses.dataclass
-class ClientResult:
-    """客户端 Worker 返回的训练结果或异常信息。"""
-
-    ok: bool
-    client_id: int
-    gpu_id: int
-    params: dict | None = None
-    num_samples: int = 0
-    pseudo_status: list | None = None
-    class_counts: np.ndarray | None = None
-    error: str | None = None
-
-
-def preload_shared_dataset(dataset):
-    """一次性读取原始图片，并将图片和标签放入 CPU 共享内存。"""
-    first_image, _ = dataset[0]
-    first_image = np.asarray(first_image, dtype=np.uint8)
-    images = np.empty((len(dataset), *first_image.shape), dtype=np.uint8)
-    labels = np.empty(len(dataset), dtype=np.int64)
-
-    images[0] = first_image
-    labels[0] = dataset[0][1]
-    for index in range(1, len(dataset)):
-        image, label = dataset[index]
-        images[index] = np.asarray(image, dtype=np.uint8)
-        labels[index] = int(label)
-
-    shared_images = torch.from_numpy(images).share_memory_()
-    shared_labels = torch.from_numpy(labels).share_memory_()
-    logger.info(
-        "已将 %d 张原始图片加载到 CPU 共享内存，形状为 %s",
-        len(dataset),
-        tuple(shared_images.shape),
-    )
-    return SharedImageDataset(shared_images, shared_labels)
-
-
-def _client_worker(gpu_id, args, shared_dataset, task_queue, result_queue):
-    """Worker 进程：在固定 GPU 上循环领取任务并执行客户端训练。"""
-    try:
-        # spawn 创建的子进程需要重新设置 Tensor 共享策略。
-        mp.set_sharing_strategy("file_system")
-        torch.cuda.set_device(gpu_id)
-        device = torch.device(f"cuda:{gpu_id}")
-        local = Local(args, device=device)
-
-        while True:
-            task = task_queue.get()
-            if task is None:
-                return
-
-            try:
-                seed = task.args.seed + task.round * 100_000 + task.client_id
-                random.seed(seed)
-                np.random.seed(seed)
-                torch.manual_seed(seed)
-                torch.cuda.manual_seed_all(seed)
-
-                labeled_view = Indices2Dataset_labeled(shared_dataset)
-                labeled_view.load(task.labeled_indices)
-                unlabeled_view = Indices2Dataset_unlabeled_fixmatch(shared_dataset)
-                unlabeled_view.load(task.unlabeled_indices)
-
-                params, pseudo_status, class_counts = local.fixmatch_train(
-                    task.args,
-                    labeled_view,
-                    unlabeled_view,
-                    task.global_params,
-                    task.round,
-                    task.client_id,
-                    global_class_dist=task.global_class_dist,
-                )
-                result_queue.put(
-                    ClientResult(
-                        ok=True,
-                        client_id=task.client_id,
-                        gpu_id=gpu_id,
-                        params=params,
-                        num_samples=len(task.labeled_indices) * labeled_view.repeat
-                        + len(task.unlabeled_indices),
-                        pseudo_status=pseudo_status,
-                        class_counts=class_counts,
-                    )
-                )
-            except (
-                RuntimeError,
-                ValueError,
-                TypeError,
-                KeyError,
-                IndexError,
-                AttributeError,
-            ) as exc:
-                result_queue.put(
-                    ClientResult(
-                        ok=False,
-                        client_id=task.client_id,
-                        gpu_id=gpu_id,
-                        error=f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}",
-                    )
-                )
-    except (
-        RuntimeError,
-        ValueError,
-        TypeError,
-        KeyError,
-        IndexError,
-        AttributeError,
-        OSError,
-    ) as exc:
-        # 初始化失败时没有具体客户端编号，使用 -1 让主进程记录设备信息并终止本轮。
-        result_queue.put(
-            ClientResult(
-                ok=False,
-                client_id=-1,
-                gpu_id=gpu_id,
-                error=f"Worker initialization failed ({type(exc).__name__}: {exc}):\n{traceback.format_exc()}",
-            )
+    def train(self, task, labeled_view, unlabeled_view):
+        params, pseudo_status, class_counts = self.local.fixmatch_train(
+            task.args,
+            labeled_view,
+            unlabeled_view,
+            task.global_params,
+            global_class_dist=task.global_class_dist,
         )
-
-
-class ClientWorkerPool:
-    """管理客户端训练进程，并通过队列分发任务、收集结果。"""
-
-    def __init__(self, gpu_ids, args, shared_dataset):
-        """按 GPU 槽位启动 Worker；同一 GPU 可对应多个进程。"""
-        # 使用共享内存文件传递 Tensor，避免默认文件描述符策略耗尽 FD。
-        mp.set_sharing_strategy("file_system")
-        self.gpu_ids = list(gpu_ids)
-        self.args = copy.deepcopy(args)
-        self.ctx = mp.get_context("spawn")
-        self.task_queue = self.ctx.Queue()
-        self.result_queue = self.ctx.Queue()
-        self.processes = []
-        self.closed = False
-        atexit.register(self.terminate)
-
-        for gpu_id in self.gpu_ids:
-            process = self.ctx.Process(
-                target=_client_worker,
-                args=(
-                    gpu_id,
-                    copy.deepcopy(args),
-                    shared_dataset,
-                    self.task_queue,
-                    self.result_queue,
-                ),
-                name=f"proxyfl-client-gpu-{gpu_id}",
-            )
-            process.start()
-            self.processes.append(process)
-
-    def run_round(self, tasks):
-        """提交一轮客户端任务，等待全部结果并按客户端编号排序。"""
-        tasks = list(tasks)
-        for task in tasks:
-            self.task_queue.put(task)
-
-        results = []
-        try:
-            for _ in tasks:
-                while True:
-                    try:
-                        result = self.result_queue.get(timeout=5)
-                        break
-                    except queue.Empty:
-                        dead = [
-                            process.name
-                            for process in self.processes
-                            if not process.is_alive()
-                        ]
-                        if dead:
-                            raise RuntimeError(
-                                "client worker exited without returning a result: "
-                                + ", ".join(dead)
-                            )
-                results.append(result)
-                if not result.ok:
-                    raise RuntimeError(
-                        f"client {result.client_id} failed on GPU {result.gpu_id}:\n"
-                        f"{result.error}"
-                    )
-        except Exception as exc:
-            round_id = tasks[0].round if tasks else -1
-            failure_dir = os.path.join(
-                "results", self.args.dataset, "parallel_failures"
-            )
-            os.makedirs(failure_dir, exist_ok=True)
-            failure_file = os.path.join(
-                failure_dir,
-                f"failure_round_{round_id}_{time.strftime('%Y%m%d_%H%M%S')}.json",
-            )
-            with open(failure_file, "w", encoding="utf8") as file:
-                json.dump(
-                    {
-                        "round": round_id,
-                        "error": str(exc),
-                        "tasks": [task.client_id for task in tasks],
-                        "args": vars(self.args),
-                    },
-                    file,
-                    ensure_ascii=False,
-                    indent=2,
-                )
-            self.terminate()
-            raise
-
-        return sorted(results, key=lambda result: result.client_id)
-
-    def close(self):
-        """发送退出信号并正常回收所有 Worker。"""
-        if self.closed:
-            return
-        for _ in self.processes:
-            self.task_queue.put(None)
-        for process in self.processes:
-            process.join()
-        self.closed = True
-
-    def terminate(self):
-        """强制终止并回收异常或未完成的 Worker。"""
-        if self.closed:
-            return
-        for process in self.processes:
-            if process.is_alive():
-                process.terminate()
-        for process in self.processes:
-            process.join()
-        self.closed = True
-
-
-def _parse_worker_gpus(args):
-    """解析 GPU 和进程数配置，返回按 Worker 展开的 GPU 编号列表。"""
-    if args.client_gpus:
-        try:
-            gpu_ids = [int(value.strip()) for value in args.client_gpus.split(",")]
-        except ValueError as exc:
-            raise ValueError("--client_gpus 必须是逗号分隔的 GPU 整数列表") from exc
-        if not gpu_ids or len(set(gpu_ids)) != len(gpu_ids):
-            raise ValueError("--client_gpus 至少需要包含一个不重复的 GPU 编号")
-    else:
-        gpu_ids = [args.gpu_id]
-
-    if not torch.cuda.is_available():
-        raise RuntimeError("多 GPU 客户端训练需要可用的 CUDA 环境")
-
-    device_count = torch.cuda.device_count()
-    invalid = [gpu_id for gpu_id in gpu_ids if gpu_id < 0 or gpu_id >= device_count]
-    if invalid:
-        raise ValueError(
-            f"GPU 编号 {invalid} 不可用；当前可见 GPU 数量为 {device_count}"
-        )
-
-    args.server_gpu = args.server_gpu if args.server_gpu is not None else gpu_ids[0]
-    if args.server_gpu not in gpu_ids:
-        raise ValueError("--server_gpu 必须包含在 --client_gpus 中")
-
-    if args.gpu_processes:
-        process_counts = {}
-        try:
-            for item in args.gpu_processes.split(","):
-                gpu_text, count_text = item.split(":", 1)
-                gpu_id, count = int(gpu_text), int(count_text)
-                if count < 1 or gpu_id in process_counts:
-                    raise ValueError
-                process_counts[gpu_id] = count
-        except ValueError as exc:
-            raise ValueError(
-                "--gpu_processes 格式必须为 GPU:进程数，例如 0:2,1:1"
-            ) from exc
-        if set(process_counts) != set(gpu_ids):
-            raise ValueError(
-                "--gpu_processes 必须为每个 --client_gpus 中的 GPU 指定进程数"
-            )
-    else:
-        process_counts = {gpu_id: 1 for gpu_id in gpu_ids}
-        if args.max_parallel_clients is not None:
-            if args.max_parallel_clients < 1:
-                raise ValueError("--max_parallel_clients 必须大于 0")
-            gpu_ids = gpu_ids[: args.max_parallel_clients]
-            process_counts = {gpu_id: 1 for gpu_id in gpu_ids}
-
-    return [gpu_id for gpu_id in gpu_ids for _ in range(process_counts[gpu_id])]
+        return {
+            "params": params,
+            "pseudo_status": pseudo_status,
+            "class_counts": class_counts,
+        }
 
 
 def fixmatch(alpha, args=None):
@@ -886,25 +693,10 @@ def fixmatch(alpha, args=None):
     # ==================== 初始化参数和日志 ====================
     if args is None:
         args = args_parser()
-    args.method = f"ProxyFL_{args.total_server_epochs // 1000}k"
-
-    log_dir = f"./results/{args.dataset}/logs"
-    os.makedirs(log_dir, exist_ok=True)
-    cr_time = time.strftime("%Y-%m-%d_%H:%M:%S", time.localtime())
-    log_file = os.path.join(log_dir, f"{args.method}_α={alpha}_{cr_time}.log")
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(message)s",
-        filename=log_file,
-    )
-
     # ==================== 创建训练集和测试集 ====================
     if args.dataset == "CIFAR10":
         args.num_classes = 10
         args.num_labeled = 500
-        args.num_rounds = 300
-        args.total_server_epochs = 30000
         transform_test = transforms.Compose(
             [
                 transforms.ToTensor(),
@@ -925,8 +717,6 @@ def fixmatch(alpha, args=None):
     ):  # training:50k; testing:10k; for training, each class includes 500 images
         args.num_classes = 100
         args.num_labeled = 50
-        args.num_rounds = 500
-        args.total_server_epochs = 5000
         transform_test = transforms.Compose(
             [
                 transforms.ToTensor(),
@@ -945,8 +735,6 @@ def fixmatch(alpha, args=None):
     elif args.dataset == "SVHN":
         args.num_classes = 10
         args.num_labeled = 460
-        args.num_rounds = 150
-        args.total_server_epochs = 15000
         transform_test = transforms.Compose(
             [
                 transforms.ToTensor(),
@@ -965,8 +753,6 @@ def fixmatch(alpha, args=None):
     elif args.dataset == "CINIC10":
         args.num_classes = 10
         args.num_labeled = 900
-        args.num_rounds = 400
-        args.total_server_epochs = 40000
         transform_test = transforms.Compose(
             [
                 transforms.ToTensor(),
@@ -975,30 +761,26 @@ def fixmatch(alpha, args=None):
                 ),
             ]
         )
-        data_local_training = CINIC10(
-            root=args.path, split="train", transform=None
-        )
+        data_local_training = CINIC10(root=args.path, split="train", transform=None)
         data_global_test = CINIC10(
             root=args.path, split="test", transform=transform_test
         )
 
     else:
         logger.error(
-            "Unsupported dataset %s. Please specify one of: CIFAR10, CIFAR100, CINIC10, or SVHN.",
+            "不支持的数据集 %s，请从以下选项中选择：CIFAR10、CIFAR100、CINIC10 或 SVHN。",
             args.dataset,
         )
         sys.exit(1)
 
-    logger.info(
-        f"dataset:{args.dataset}\n"
-        f"num_classes:{args.num_classes}\n"
-        f"num_labeled:{args.num_labeled}\n"
-        f"non_iid:{args.alpha}\n"
-        f"mu:{args.mu}\n"
-        f"num_rounds:{args.num_rounds}\n"
-        f"batch_label:{args.batch_size_local_labeled_fixmatch}, "
-        f"batch_unlabel:{args.batch_size_local_labeled_fixmatch * args.mu}"
-    )
+    args.method = "proxyfl"
+
+    # ==================== 注册实验运行（唯一目录 + SQLite 索引） ====================
+    run = create_run(args)
+    setup_logging(run.log_file, level=args.log_level)
+    logger.info("运行 ID：%s，结果目录：%s", run.run_id, run.dir)
+
+    log_args(args)
 
     # ==================== 按类别划分数据索引 ====================
     random_state = np.random.RandomState(args.seed)
@@ -1028,14 +810,14 @@ def fixmatch(alpha, args=None):
             num_classes=args.num_classes,
             num_clients=args.num_clients,
             non_iid_alpha=alpha,
-            seed=0,
+            seed=args.seed,
         )
         list_client2indices_unlabeled = clients_indices(
             list_label2indices=list_label2indices_unlabeled,
             num_classes=args.num_classes,
             num_clients=args.num_clients,
             non_iid_alpha=alpha,
-            seed=0,
+            seed=args.seed,
         )
 
     # ==================== 划分客户端数据并显示分布 ====================
@@ -1056,13 +838,15 @@ def fixmatch(alpha, args=None):
         )
 
     # ==================== 创建服务端和客户端 Worker ====================
-    client_gpus = _parse_worker_gpus(args)
+    client_gpus = parse_worker_gpus(args, require_server_gpu_in_clients=True)
     args.gpu_id = args.server_gpu
     global_model = Global(args)
     # 在创建共享数据集之前设置共享策略，避免预加载阶段产生大量文件描述符。
     mp.set_sharing_strategy("file_system")
     shared_dataset = preload_shared_dataset(data_local_training)
-    worker_pool = ClientWorkerPool(client_gpus, args, shared_dataset)
+    worker_pool = ClientWorkerPool(
+        client_gpus, args, shared_dataset, trainer_cls=ClientTrainer
+    )
 
     total_clients = list(range(args.num_clients))
 
@@ -1074,8 +858,9 @@ def fixmatch(alpha, args=None):
     current_global_dist = global_model.update_global_distribution()
 
     # ==================== 联邦学习主循环 ====================
-    progress = tqdm(range(1, args.num_rounds + 1), desc="Server")
+    progress = tqdm(range(1, args.num_rounds + 1), desc=args.method)
     for r in progress:
+        logger.info("========== 第 %d 轮 ==========", r)
         list_local_class_counts = []
 
         dict_global_params = global_model.download_params()
@@ -1119,6 +904,135 @@ def fixmatch(alpha, args=None):
             num_clients_u_valid += pseudo_status[2]
             list_local_class_counts.append(result.class_counts)
 
+        # ==================== 伪标签与标签集统计（拼接为一条 DEBUG） ====================
+        sum_total = sum_valid = sum_low = sum_gt_in_set = 0
+        sum_high_corrects = 0
+        sum_hist = None
+        sum_hit_hist = None
+        model_counts_total = [0] * 8
+        lines = []
+
+        def format_eval_pair(counts, offset):
+            """模型分类段的半边：有标签与无标签两个准确率。"""
+            parts = []
+            for offset_base, name in ((offset, "有标签"), (offset + 2, "无标签")):
+                hit, total = int(counts[offset_base]), int(counts[offset_base + 1])
+                parts.append(
+                    f"{name} {hit / total:.1%}({hit}/{total})" if total else f"{name} —"
+                )
+            return f"[{', '.join(parts)}]"
+
+        def format_counts(hist, low_total):
+            """标签集大小段的每桶计数与占低置信样本比例。"""
+            parts = []
+            for size, count in enumerate(hist):
+                if not count:
+                    continue
+                if size == 0:
+                    # 空标签集：一个候选类都没有
+                    parts.append(f"0(空集): {count}(占{count / low_total:.1%})")
+                else:
+                    parts.append(f"{size}: {count}(占{count / low_total:.1%})")
+            return "{" + ", ".join(parts) + "}" if parts else "空"
+
+        def format_acc(hist, hit_hist):
+            """准确率段的逐桶命中率；空集与零命中的桶不显示。"""
+            parts = [
+                f"{size}: {hit_hist[size] / count:.1%}({hit_hist[size]}/{count})"
+                for size, count in enumerate(hist)
+                if count and size and hit_hist[size]
+            ]
+            return "{" + ", ".join(parts) + "}" if parts else "空"
+
+        for result in results:
+            status = result.pseudo_status
+            num_total, num_valid = status[0], status[2]
+            num_low, num_gt_in_set, hist, hit_hist = (
+                status[5],
+                status[6],
+                status[7],
+                status[8],
+            )
+            num_high_corrects = status[9]
+            model_counts = status[10]
+            for idx, value in enumerate(model_counts):
+                model_counts_total[idx] += value
+            sum_total += num_total
+            sum_valid += num_valid
+            sum_low += num_low
+            sum_gt_in_set += num_gt_in_set
+            sum_high_corrects += num_high_corrects
+            if sum_hist is None or sum_hit_hist is None:
+                sum_hist = list(hist)
+                sum_hit_hist = list(hit_hist)
+            else:
+                sum_hist = [a + b for a, b in zip(sum_hist, hist)]
+                sum_hit_hist = [a + b for a, b in zip(sum_hit_hist, hit_hist)]
+
+            valid_part = (
+                f"{num_valid / num_total:.1%}({num_valid}/{num_total})"
+                if num_total
+                else "0.0%(0/0)"
+            )
+            high_acc_part = (
+                f"{num_high_corrects / num_valid:.1%}({num_high_corrects}/{num_valid})"
+                if num_valid
+                else "—"
+            )
+            if num_low:
+                hit_part = f"{num_gt_in_set / num_low:.1%}({num_gt_in_set}/{num_low})"
+                set_part = format_counts(hist, num_low)
+                acc_part = format_acc(hist, hit_hist)
+            else:
+                set_part = "无低置信样本"
+                acc_part = "—"
+                hit_part = "—"
+            lines.append(
+                f"客户端 {result.client_id}：高置信 {valid_part}｜"
+                f"高置信伪标签准确率 {high_acc_part}｜"
+                f"低置信标签集大小 {set_part}｜真实标签∈标签集 {acc_part}｜整体 {hit_part}"
+            )
+            lines.append(
+                f"客户端 {result.client_id}：模型分类 {format_eval_pair(model_counts, 0)}｜"
+                f"全局模型分类 {format_eval_pair(model_counts, 4)}"
+            )
+
+        total_valid_part = (
+            f"{sum_valid / sum_total:.1%}({sum_valid}/{sum_total})"
+            if sum_total
+            else "0.0%(0/0)"
+        )
+        total_high_acc_part = (
+            f"{sum_high_corrects / sum_valid:.1%}({sum_high_corrects}/{sum_valid})"
+            if sum_valid
+            else "—"
+        )
+        total_set_part = (
+            format_counts(sum_hist, sum_low)
+            if sum_hist is not None and sum_low
+            else ("无低置信样本" if not sum_low else "空")
+        )
+        total_acc_part = (
+            format_acc(sum_hist, sum_hit_hist)
+            if sum_hist is not None and sum_low
+            else "—"
+        )
+        total_hit_part = (
+            f"{sum_gt_in_set / sum_low:.1%}({sum_gt_in_set}/{sum_low})"
+            if sum_low
+            else "—"
+        )
+        lines.append(
+            f"第 {r} 轮合计：高置信 {total_valid_part}｜"
+            f"高置信伪标签准确率 {total_high_acc_part}｜"
+            f"低置信标签集大小 {total_set_part}｜真实标签∈标签集 {total_acc_part}｜整体 {total_hit_part}"
+        )
+        lines.append(
+            f"第 {r} 轮合计：模型分类 {format_eval_pair(model_counts_total, 0)}｜"
+            f"全局模型分类 {format_eval_pair(model_counts_total, 4)}"
+        )
+        logger.debug("第 %d 轮伪标签统计：\n%s", r, "\n".join(lines))
+
         pseudo_acc = (
             num_clients_u_corrects / num_clients_u_total if num_clients_u_total else 0.0
         )
@@ -1145,16 +1059,12 @@ def fixmatch(alpha, args=None):
             copy.deepcopy(fedavg_params), data_global_test, args.batch_size_test
         )
         fedavg_acc.append(global_acc)
+        logger.info("第 %d 轮全局模型精度：%.2f%%", r, global_acc * 100)
 
         progress.set_postfix(acc=f"{global_acc:.2%}")
 
         # ==================== 保存模型和训练指标 ====================
-        result_dir = f"./results/{args.dataset}"
-        os.makedirs(result_dir, exist_ok=True)
-
-        # 创建当前实验的结果目录
-        result_dir_spec = f"{result_dir}/{args.method}_α={alpha}_{cr_time}"
-        os.makedirs(result_dir_spec, exist_ok=True)
+        result_dir_spec = run.checkpoint_dir
 
         if (
             r == 1
@@ -1176,9 +1086,9 @@ def fixmatch(alpha, args=None):
                 f"{result_dir_spec}/all_classifier_weights_round_{r}.npy",
                 classifier_weights_numpy,
             )
-            logger.info("Saved model and proxy for round %d", r)
+            logger.info("第 %d 轮模型与代理已保存", r)
 
-        result_file = f"{result_dir}/{args.method}_α={alpha}_{cr_time}.csv"
+        result_file = run.dir / "metrics.csv"
         acc_num_pseudo_label_csv_index = list(range(1, len(fedavg_acc) + 1))
         acc_num_pseudo_label_csv_df = pd.DataFrame(
             {"acc": fedavg_acc}, index=acc_num_pseudo_label_csv_index
@@ -1186,9 +1096,7 @@ def fixmatch(alpha, args=None):
         # 保存文件
         acc_num_pseudo_label_csv_df.to_csv(result_file, encoding="utf8")
 
-        result_pseudo_file = (
-            f"{result_dir}/{args.method}_α={alpha}_pseudo_{cr_time}.csv"
-        )
+        result_pseudo_file = run.dir / "pseudo_metrics.csv"
         # 取各项指标长度的最小值，确保 CSV 行数一致
         min_length = min(
             len(fedavg_pseudo_acc),
@@ -1213,10 +1121,12 @@ def fixmatch(alpha, args=None):
 
         # 保存文件
         metrics_df.to_csv(result_pseudo_file, encoding="utf8")
-        logger.info("Metrics saved to %s", result_pseudo_file)
 
     # 所有轮次完成后，向 Worker 发送退出信号并回收进程。
     worker_pool.close()
+    run.finish(
+        best_acc=max(fedavg_acc) if fedavg_acc else None, num_rounds=args.num_rounds
+    )
 
 
 if __name__ == "__main__":
@@ -1229,4 +1139,4 @@ if __name__ == "__main__":
     torch.backends.cudnn.deterministic = False
     torch.backends.cudnn.benchmark = True
 
-    fixmatch(args.alpha, args)
+    run_main(lambda: fixmatch(args.alpha, args))

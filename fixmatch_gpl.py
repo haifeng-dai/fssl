@@ -1,14 +1,8 @@
-import atexit
 import copy
-import dataclasses
-import json
 import logging
-import os
-import queue
 import random
 import sys
 import time
-import traceback
 
 import numpy as np
 import pandas as pd
@@ -23,9 +17,6 @@ from tqdm import tqdm
 
 from Dataset.CINIC10 import CINIC10
 from Dataset.dataset import (
-    Indices2Dataset_labeled,
-    Indices2Dataset_unlabeled_fixmatch,
-    SharedImageDataset,
     classify_label,
     partition_train,
     show_clients_data_distribution,
@@ -33,6 +24,15 @@ from Dataset.dataset import (
 from Dataset.sample_dirichlet import clients_indices, clients_indices_homo
 from Model.resnet import ResNet_PC
 from options import args_parser
+from utils.client_pool import (
+    ClientTask,
+    ClientWorkerPool,
+    parse_worker_gpus,
+    preload_shared_dataset,
+    run_main,
+)
+from utils.logging_setup import log_args, setup_logging
+from utils.run_registry import create_run
 
 logger = logging.getLogger(__name__)
 
@@ -115,8 +115,9 @@ class Global:
             for name, value in self.model.state_dict().items()
         }
 
+
 class Local:
-    """客户端训练器：以冻结的本轮全局模型作为 FixMatch 伪标签教师。"""
+    """客户端训练器：以冻结的本轮全局模型提供 FixMatch 伪标签。"""
 
     def __init__(self, args, device=None):
         self.device = device or torch.device(
@@ -134,8 +135,8 @@ class Local:
         )
         self.local_model.to(self.device)
 
-        # 教师与学生分离：每轮由 global_params 刷新一次，随后保持冻结。
-        self.global_teacher = ResNet_PC(
+        # 与局部模型分离为两份实例：每轮由 global_params 刷新一次，随后保持冻结。
+        self.global_model = ResNet_PC(
             resnet_size=8,
             scaling=4,
             save_activations=False,
@@ -144,7 +145,7 @@ class Local:
             freeze_bn_affine=False,
             num_classes=args.num_classes,
         )
-        self.global_teacher.to(self.device)
+        self.global_model.to(self.device)
 
         self.optimizer = SGD(
             self.local_model.parameters(),
@@ -160,7 +161,7 @@ class Local:
         data_client_unlabeled,
         global_params,
     ):
-        """全局教师伪标签的 FixMatch：监督项加上强弱增强一致性项。"""
+        """全局模型伪标签的 FixMatch：监督项加上强弱增强一致性项。"""
         train_start = time.perf_counter()
         labeled_trainloader = DataLoader(
             dataset=data_client_labeled,
@@ -178,8 +179,8 @@ class Local:
 
         # 载入本轮最新的全局参数
         self.local_model.load_state_dict(global_params)
-        self.global_teacher.load_state_dict(global_params)
-        self.global_teacher.eval()
+        self.global_model.load_state_dict(global_params)
+        self.global_model.eval()
         # 彻底清空 SGD 动量，保证各客户端状态隔离
         self.optimizer.state.clear()
         self.local_model.train()
@@ -188,6 +189,8 @@ class Local:
         num_pseudo_corrects = 0
         num_pseudo_total = 0
         num_u_valid = 0
+        # 高置信子集的伪标签正确数（仅统计 mask 选中的样本）
+        num_high_corrects = 0
         pseudo_client_acc = 0.0
         u_client_valid = 0.0
         # 每个本地 epoch 按无标签 DataLoader 的实际批次数训练。
@@ -232,7 +235,7 @@ class Local:
 
                 # 2. 冻结的本轮全局模型在弱增强视图上生成伪标签。
                 with torch.no_grad():
-                    _, logits_u_w_global = self.global_teacher(inputs_u_w)
+                    _, logits_u_w_global = self.global_model(inputs_u_w)
                     pseudo_label = torch.softmax(logits_u_w_global / args.T, dim=-1)
                     max_probs, targets_u = torch.max(pseudo_label, dim=-1)
                     mask = max_probs.ge(args.threshold).float()
@@ -242,7 +245,7 @@ class Local:
                     F.cross_entropy(logits_u_s, targets_u, reduction="none") * mask
                 ).mean()
 
-                # 纯全局教师 FixMatch 目标：不包含原型、锚点或其他特征约束。
+                # 纯全局模型 FixMatch 目标：不包含原型、锚点或其他特征约束。
                 loss = Lx + args.lambda_u * Lu
 
                 # 统计最后一个 epoch 的伪标签质量
@@ -254,6 +257,16 @@ class Local:
                     )
                     num_pseudo_total += len(targets_u)
                     num_u_valid += int(mask.sum().item())
+                    if mask.sum() > 0:
+                        valid_idx = mask.bool()
+                        num_high_corrects += (
+                            torch.eq(
+                                targets_u[valid_idx].cpu(),
+                                targets_u_groundtruth[valid_idx].cpu(),
+                            )
+                            .sum()
+                            .item()
+                        )
 
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -273,6 +286,7 @@ class Local:
             num_u_valid,
             pseudo_client_acc,
             u_client_valid,
+            num_high_corrects,
         ]
         return (
             {
@@ -294,334 +308,35 @@ class Local:
         return x.reshape([size, -1] + s[1:]).transpose(0, 1).reshape([-1] + s[1:])
 
 
-@dataclasses.dataclass
-class ClientTask:
-    """主进程下发给客户端 Worker 的单次训练任务。"""
+class ClientTrainer:
+    """Worker 进程内的客户端训练适配器，供公共进程池调用。"""
 
-    round: int
-    client_id: int
-    labeled_indices: list[int]
-    unlabeled_indices: list[int]
-    global_params: dict[str, torch.Tensor]
-    args: object
+    def __init__(self, args, device):
+        self.local = Local(args, device=device)
 
-
-@dataclasses.dataclass
-class ClientResult:
-    """客户端 Worker 训练结束返回的结果对象。"""
-
-    ok: bool
-    client_id: int
-    gpu_id: int
-    params: dict[str, torch.Tensor] | None = None
-    num_samples: int = 0
-    pseudo_status: list[float] | None = None
-    elapsed_seconds: float = 0.0
-    error: str | None = None
-
-
-def preload_shared_dataset(dataset):
-    """一次性读取原始图片，并将图片和标签放入 CPU 共享内存。"""
-    first_image, _ = dataset[0]
-    first_image = np.asarray(first_image, dtype=np.uint8)
-    images = np.empty((len(dataset), *first_image.shape), dtype=np.uint8)
-    labels = np.empty(len(dataset), dtype=np.int64)
-
-    images[0] = first_image
-    labels[0] = dataset[0][1]
-    for index in range(1, len(dataset)):
-        image, label = dataset[index]
-        images[index] = np.asarray(image, dtype=np.uint8)
-        labels[index] = int(label)
-
-    shared_images = torch.from_numpy(images).share_memory_()
-    shared_labels = torch.from_numpy(labels).share_memory_()
-    logger.info(
-        "已将 %d 张原始图片加载到 CPU 共享内存，形状为 %s",
-        len(dataset),
-        tuple(shared_images.shape),
-    )
-    return SharedImageDataset(shared_images, shared_labels)
-
-
-def _client_worker(
-    gpu_id, args, shared_dataset, task_queue, result_queue, log_file=None
-):
-    """Worker 进程：在固定 GPU 上循环领取任务并执行客户端训练。"""
-    try:
-        # spawn 创建的子进程需要配置 logger，保证客户端训练日志正常输出
-        if log_file:
-            logging.basicConfig(
-                level=logging.INFO,
-                format="%(asctime)s - %(levelname)s - %(message)s",
-                filename=log_file,
-                force=True,
-            )
-
-        mp.set_sharing_strategy("file_system")
-        torch.cuda.set_device(gpu_id)
-        device = torch.device(f"cuda:{gpu_id}")
-        local = Local(args, device=device)
-
-        while True:
-            task = task_queue.get()
-            if task is None:
-                return
-
-            try:
-                seed = task.args.seed + task.round * 100_000 + task.client_id
-                random.seed(seed)
-                np.random.seed(seed)
-                torch.manual_seed(seed)
-                torch.cuda.manual_seed_all(seed)
-
-                labeled_view = Indices2Dataset_labeled(shared_dataset)
-                labeled_view.load(task.labeled_indices)
-                unlabeled_view = Indices2Dataset_unlabeled_fixmatch(shared_dataset)
-                unlabeled_view.load(task.unlabeled_indices)
-
-                (
-                    params,
-                    pseudo_status,
-                    elapsed_seconds,
-                ) = local.train(
-                    task.args,
-                    labeled_view,
-                    unlabeled_view,
-                    task.global_params,
-                )
-                result_queue.put(
-                    ClientResult(
-                        ok=True,
-                        client_id=task.client_id,
-                        gpu_id=gpu_id,
-                        params=params,
-                        num_samples=len(task.labeled_indices) * labeled_view.repeat
-                        + len(task.unlabeled_indices),
-                        pseudo_status=pseudo_status,
-                        elapsed_seconds=elapsed_seconds,
-                    )
-                )
-            except (
-                RuntimeError,
-                ValueError,
-                TypeError,
-                KeyError,
-                IndexError,
-                AttributeError,
-            ) as exc:
-                result_queue.put(
-                    ClientResult(
-                        ok=False,
-                        client_id=task.client_id,
-                        gpu_id=gpu_id,
-                        error=f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}",
-                    )
-                )
-    except (
-        RuntimeError,
-        ValueError,
-        TypeError,
-        KeyError,
-        IndexError,
-        AttributeError,
-        OSError,
-    ) as exc:
-        result_queue.put(
-            ClientResult(
-                ok=False,
-                client_id=-1,
-                gpu_id=gpu_id,
-                error=f"Worker initialization failed ({type(exc).__name__}: {exc}):\n{traceback.format_exc()}",
-            )
+    def train(self, task, labeled_view, unlabeled_view):
+        params, pseudo_status, elapsed_seconds = self.local.train(
+            task.args,
+            labeled_view,
+            unlabeled_view,
+            task.global_params,
         )
-
-
-class ClientWorkerPool:
-    """管理客户端训练进程池，支持多卡/单卡多进程调度。"""
-
-    def __init__(self, gpu_ids, args, shared_dataset, log_file=None):
-        mp.set_sharing_strategy("file_system")
-        self.gpu_ids = list(gpu_ids)
-        self.args = copy.deepcopy(args)
-        self.ctx = mp.get_context("spawn")
-        self.task_queue = self.ctx.Queue()
-        self.result_queue = self.ctx.Queue()
-        self.processes = []
-        self.closed = False
-        atexit.register(self.terminate)
-
-        for gpu_id in self.gpu_ids:
-            process = self.ctx.Process(
-                target=_client_worker,
-                args=(
-                    gpu_id,
-                    copy.deepcopy(args),
-                    shared_dataset,
-                    self.task_queue,
-                    self.result_queue,
-                    log_file,
-                ),
-                name=f"fssl-client-gpu-{gpu_id}",
-            )
-            process.start()
-            self.processes.append(process)
-
-    def run_round(self, tasks):
-        """提交一轮客户端任务并收集按 client_id 排序后的结果。"""
-        tasks = list(tasks)
-        for task in tasks:
-            self.task_queue.put(task)
-
-        results = []
-        try:
-            for _ in tasks:
-                while True:
-                    try:
-                        result = self.result_queue.get(timeout=5)
-                        break
-                    except queue.Empty:
-                        dead = [
-                            process.name
-                            for process in self.processes
-                            if not process.is_alive()
-                        ]
-                        if dead:
-                            raise RuntimeError(
-                                "client worker exited without returning a result: "
-                                + ", ".join(dead)
-                            )
-                results.append(result)
-                if not result.ok:
-                    raise RuntimeError(
-                        f"client {result.client_id} failed on GPU {result.gpu_id}:\n"
-                        f"{result.error}"
-                    )
-        except Exception as exc:
-            round_id = tasks[0].round if tasks else -1
-            failure_dir = os.path.join(
-                "results", self.args.dataset, "parallel_failures"
-            )
-            os.makedirs(failure_dir, exist_ok=True)
-            failure_file = os.path.join(
-                failure_dir,
-                f"failure_round_{round_id}_{time.strftime('%Y%m%d_%H%M%S')}.json",
-            )
-            with open(failure_file, "w", encoding="utf8") as file:
-                json.dump(
-                    {
-                        "round": round_id,
-                        "error": str(exc),
-                        "tasks": [task.client_id for task in tasks],
-                        "args": vars(self.args),
-                    },
-                    file,
-                    ensure_ascii=False,
-                    indent=2,
-                )
-            self.terminate()
-            raise
-
-        return sorted(results, key=lambda result: result.client_id)
-
-    def close(self):
-        """发送退出信号并回收所有 Worker。"""
-        if self.closed:
-            return
-        for _ in self.processes:
-            self.task_queue.put(None)
-        for process in self.processes:
-            process.join()
-        self.closed = True
-
-    def terminate(self):
-        """强制终止 Worker 进程。"""
-        if self.closed:
-            return
-        for process in self.processes:
-            if process.is_alive():
-                process.terminate()
-        for process in self.processes:
-            process.join()
-        self.closed = True
-
-
-def _parse_worker_gpus(args):
-    """解析 GPU 和进程数配置。"""
-    if args.client_gpus:
-        try:
-            gpu_ids = [int(value.strip()) for value in args.client_gpus.split(",")]
-        except ValueError as exc:
-            raise ValueError("--client_gpus 必须是逗号分隔的 GPU 整数列表") from exc
-        if not gpu_ids or len(set(gpu_ids)) != len(gpu_ids):
-            raise ValueError("--client_gpus 至少需要包含一个不重复的 GPU 编号")
-    else:
-        gpu_ids = [args.gpu_id]
-
-    if not torch.cuda.is_available():
-        raise RuntimeError("多 GPU 训练需要可用的 CUDA 环境")
-
-    device_count = torch.cuda.device_count()
-    invalid = [gpu_id for gpu_id in gpu_ids if gpu_id < 0 or gpu_id >= device_count]
-    if invalid:
-        raise ValueError(
-            f"GPU 编号 {invalid} 不可用；当前可见 GPU 数量为 {device_count}"
-        )
-
-    args.server_gpu = args.server_gpu if args.server_gpu is not None else gpu_ids[0]
-    if args.server_gpu < 0 or args.server_gpu >= device_count:
-        raise ValueError(f"--server_gpu {args.server_gpu} 超出可用 GPU 范围")
-
-    if args.gpu_processes:
-        process_counts = {}
-        try:
-            for item in args.gpu_processes.split(","):
-                gpu_text, count_text = item.split(":", 1)
-                gpu_id, count = int(gpu_text), int(count_text)
-                if count < 1 or gpu_id in process_counts:
-                    raise ValueError
-                process_counts[gpu_id] = count
-        except ValueError as exc:
-            raise ValueError(
-                "--gpu_processes 格式必须为 GPU:进程数，例如 0:2,1:1"
-            ) from exc
-        if set(process_counts) != set(gpu_ids):
-            raise ValueError(
-                "--gpu_processes 必须为每个 --client_gpus 中的 GPU 指定进程数"
-            )
-    else:
-        process_counts = {gpu_id: 1 for gpu_id in gpu_ids}
-        if args.max_parallel_clients is not None:
-            if args.max_parallel_clients < 1:
-                raise ValueError("--max_parallel_clients 必须大于 0")
-            gpu_ids = gpu_ids[: args.max_parallel_clients]
-            process_counts = {gpu_id: 1 for gpu_id in gpu_ids}
-
-    return [gpu_id for gpu_id in gpu_ids for _ in range(process_counts[gpu_id])]
+        return {
+            "params": params,
+            "pseudo_status": pseudo_status,
+            "elapsed_seconds": elapsed_seconds,
+        }
 
 
 def fedavg_fixmatch(alpha, args=None):
     """执行纯净的联邦半监督学习 (FedAvg + FixMatch)。"""
     if args is None:
         args = args_parser()
-    args.method = "FedAvg_FixMatch"
-
-    log_dir = f"./results/{args.dataset}/logs"
-    os.makedirs(log_dir, exist_ok=True)
-    cr_time = time.strftime("%Y-%m-%d_%H:%M:%S", time.localtime())
-    log_file = os.path.join(log_dir, f"{args.method}_α={alpha}_{cr_time}.log")
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(message)s",
-        filename=log_file,
-        force=True,
-    )
+    args.method = "fixmatch_gpl"
 
     if args.dataset == "CIFAR10":
         args.num_classes = 10
         args.num_labeled = 500
-        args.num_rounds = 300
         transform_test = transforms.Compose(
             [
                 transforms.ToTensor(),
@@ -640,7 +355,6 @@ def fedavg_fixmatch(alpha, args=None):
     elif args.dataset == "CIFAR100":
         args.num_classes = 100
         args.num_labeled = 50
-        args.num_rounds = 500
         transform_test = transforms.Compose(
             [
                 transforms.ToTensor(),
@@ -659,7 +373,6 @@ def fedavg_fixmatch(alpha, args=None):
     elif args.dataset == "SVHN":
         args.num_classes = 10
         args.num_labeled = 460
-        args.num_rounds = 150
         transform_test = transforms.Compose(
             [
                 transforms.ToTensor(),
@@ -678,7 +391,6 @@ def fedavg_fixmatch(alpha, args=None):
     elif args.dataset == "CINIC10":
         args.num_classes = 10
         args.num_labeled = 900
-        args.num_rounds = 400
         transform_test = transforms.Compose(
             [
                 transforms.ToTensor(),
@@ -693,19 +405,15 @@ def fedavg_fixmatch(alpha, args=None):
         )
 
     else:
-        print(f"Error: Unsupported dataset {args.dataset}.")
+        logger.error("不支持的数据集：%s", args.dataset)
         sys.exit(1)
 
-    logger.info(
-        f"dataset:{args.dataset}\n"
-        f"num_classes:{args.num_classes}\n"
-        f"num_labeled:{args.num_labeled}\n"
-        f"non_iid:{args.alpha}\n"
-        f"mu:{args.mu}\n"
-        f"num_rounds:{args.num_rounds}\n"
-        f"batch_labeled:{args.batch_size_local_labeled_fixmatch}\n"
-        f"batch_unlabeled:{args.batch_size_local_labeled_fixmatch * args.mu}"
-    )
+    # ==================== 注册实验运行（唯一目录 + SQLite 索引） ====================
+    run = create_run(args)
+    setup_logging(run.log_file, level=args.log_level)
+    logger.info("运行 ID：%s，结果目录：%s", run.run_id, run.dir)
+
+    log_args(args)
 
     random_state = np.random.RandomState(args.seed)
     list_label2indices = classify_label(data_local_training, args.num_classes)
@@ -730,14 +438,14 @@ def fedavg_fixmatch(alpha, args=None):
             num_classes=args.num_classes,
             num_clients=args.num_clients,
             non_iid_alpha=alpha,
-            seed=0,
+            seed=args.seed,
         )
         list_client2indices_unlabeled = clients_indices(
             list_label2indices=list_label2indices_unlabeled,
             num_classes=args.num_classes,
             num_clients=args.num_clients,
             non_iid_alpha=alpha,
-            seed=0,
+            seed=args.seed,
         )
 
     show_clients_data_distribution(
@@ -755,13 +463,19 @@ def fedavg_fixmatch(alpha, args=None):
             ]
         )
 
-    client_gpus = _parse_worker_gpus(args)
+    client_gpus = parse_worker_gpus(args)
     args.gpu_id = args.server_gpu
     global_model = Global(args)
 
     mp.set_sharing_strategy("file_system")
     shared_dataset = preload_shared_dataset(data_local_training)
-    worker_pool = ClientWorkerPool(client_gpus, args, shared_dataset, log_file=log_file)
+    worker_pool = ClientWorkerPool(
+        client_gpus,
+        args,
+        shared_dataset,
+        trainer_cls=ClientTrainer,
+        log_file=str(run.log_file),
+    )
 
     total_clients = list(range(args.num_clients))
 
@@ -769,7 +483,7 @@ def fedavg_fixmatch(alpha, args=None):
     fedavg_pseudo_acc: list[float] = []
     fedavg_num_valid: list[int] = []
     fedavg_valid_ratio: list[float] = []
-    progress = tqdm(range(1, args.num_rounds + 1), desc="Test")
+    progress = tqdm(range(1, args.num_rounds + 1), desc=args.method)
     for r in progress:
         dict_global_params = global_model.download_params()
         online_clients = random_state.choice(
@@ -803,11 +517,49 @@ def fedavg_fixmatch(alpha, args=None):
         list_dicts_local_params = [result.params for result in results]
         list_nums_local_data = [result.num_samples for result in results]
 
+        # ==================== 高置信统计（逐客户端 + 合计，一条 DEBUG） ====================
+        sum_total = sum_valid = sum_high_corrects = 0
+        high_lines = []
         for result in results:
             pseudo_status = result.pseudo_status
             num_clients_u_total += pseudo_status[0]
             num_clients_u_corrects += pseudo_status[1]
             num_clients_u_valid += pseudo_status[2]
+            num_total, num_valid, num_high_corrects = (
+                pseudo_status[0],
+                pseudo_status[2],
+                pseudo_status[5],
+            )
+            sum_total += num_total
+            sum_valid += num_valid
+            sum_high_corrects += num_high_corrects
+            ratio_part = (
+                f"{num_valid / num_total:.1%}({num_valid}/{num_total})"
+                if num_total
+                else "0.0%(0/0)"
+            )
+            acc_part = (
+                f"{num_high_corrects / num_valid:.1%}({num_high_corrects}/{num_valid})"
+                if num_valid
+                else "—"
+            )
+            high_lines.append(
+                f"客户端 {result.client_id}：比例 {ratio_part}｜准确率 {acc_part}"
+            )
+        total_ratio_part = (
+            f"{sum_valid / sum_total:.1%}({sum_valid}/{sum_total})"
+            if sum_total
+            else "0.0%(0/0)"
+        )
+        total_acc_part = (
+            f"{sum_high_corrects / sum_valid:.1%}({sum_high_corrects}/{sum_valid})"
+            if sum_valid
+            else "—"
+        )
+        high_lines.append(
+            f"第 {r} 轮合计：比例 {total_ratio_part}｜准确率 {total_acc_part}"
+        )
+        logger.debug("第 %d 轮高置信统计：\n%s", r, "\n".join(high_lines))
 
         pseudo_acc = (
             num_clients_u_corrects / num_clients_u_total if num_clients_u_total else 0.0
@@ -832,10 +584,7 @@ def fedavg_fixmatch(alpha, args=None):
 
         progress.set_postfix(acc=f"{global_acc:.2%}")
 
-        result_dir = f"./results/{args.dataset}"
-        os.makedirs(result_dir, exist_ok=True)
-        result_dir_spec = f"{result_dir}/{args.method}_α={alpha}_{cr_time}"
-        os.makedirs(result_dir_spec, exist_ok=True)
+        result_dir_spec = run.checkpoint_dir
 
         if (
             r == 1
@@ -843,17 +592,14 @@ def fedavg_fixmatch(alpha, args=None):
             or (r % 50 == 0 and r > 0.8 * args.num_rounds)
         ):
             torch.save(fedavg_params, f"{result_dir_spec}/fedavg_params_round_{r}.pth")
-            print(f"Saved model for round {r}")
 
-        result_file = f"{result_dir}/{args.method}_α={alpha}_{cr_time}.csv"
+        result_file = run.dir / "metrics.csv"
         acc_df = pd.DataFrame(
             {"acc": fedavg_acc}, index=list(range(1, len(fedavg_acc) + 1))
         )
         acc_df.to_csv(result_file, encoding="utf8")
 
-        result_pseudo_file = (
-            f"{result_dir}/{args.method}_α={alpha}_pseudo_{cr_time}.csv"
-        )
+        result_pseudo_file = run.dir / "pseudo_metrics.csv"
         min_length = min(
             len(fedavg_pseudo_acc),
             len(fedavg_valid_ratio),
@@ -873,6 +619,9 @@ def fedavg_fixmatch(alpha, args=None):
         metrics_df.to_csv(result_pseudo_file, encoding="utf8")
 
     worker_pool.close()
+    run.finish(
+        best_acc=max(fedavg_acc) if fedavg_acc else None, num_rounds=args.num_rounds
+    )
 
 
 if __name__ == "__main__":
@@ -885,4 +634,4 @@ if __name__ == "__main__":
     torch.backends.cudnn.deterministic = False
     torch.backends.cudnn.benchmark = True
 
-    fedavg_fixmatch(args.alpha, args)
+    run_main(lambda: fedavg_fixmatch(args.alpha, args))
