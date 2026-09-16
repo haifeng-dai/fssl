@@ -22,7 +22,7 @@ from Dataset.dataset import (
     show_clients_data_distribution,
 )
 from Dataset.sample_dirichlet import clients_indices, clients_indices_homo
-from Model.resnet import ResNet_PC
+from Model.factory import build_model
 from options import args_parser
 from utils.client_pool import (
     ClientTask,
@@ -46,15 +46,7 @@ class Global:
         self.device = torch.device(
             f"cuda:{self.gpu_id}" if torch.cuda.is_available() else "cpu"
         )
-        self.model = ResNet_PC(
-            resnet_size=8,
-            scaling=4,
-            save_activations=False,
-            group_norm_num_groups=None,
-            freeze_bn=False,
-            freeze_bn_affine=False,
-            num_classes=args.num_classes,
-        )
+        self.model = build_model(args)
         self.model.to(self.device)
 
     def aggregate(
@@ -124,15 +116,7 @@ class Local:
             f"cuda:{args.gpu_id}" if torch.cuda.is_available() else "cpu"
         )
 
-        self.local_model = ResNet_PC(
-            resnet_size=8,
-            scaling=4,
-            save_activations=False,
-            group_norm_num_groups=None,
-            freeze_bn=False,
-            freeze_bn_affine=False,
-            num_classes=args.num_classes,
-        )
+        self.local_model = build_model(args)
         self.local_model.to(self.device)
 
         self.optimizer = SGD(

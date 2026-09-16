@@ -18,6 +18,18 @@ def args_parser():
         help="基准数据集: 支持 CIFAR10 / CIFAR100 / SVHN / CINIC10",
     )
     parser.add_argument(
+        "--model",
+        choices=("resnet", "cnn"),
+        default="cnn",
+        help="模型结构：cnn（默认）或 resnet",
+    )
+    parser.add_argument(
+        "--cnn_feature_dim",
+        type=int,
+        default=512,
+        help="--model cnn 时的特征维度",
+    )
+    parser.add_argument(
         "--num_clients",
         type=int,
         default=20,
@@ -131,13 +143,43 @@ def args_parser():
         "--lambda_u",
         type=float,
         default=1.0,
-        help="客户端无标签 KL 一致性损失 (Lu) 的权重",
+        help="客户端高置信伪标签交叉熵损失 (Lu) 的权重",
     )
     parser.add_argument(
         "--lambda_proto",
         type=float,
         default=1.0,
-        help="客户端原型标签集合对比损失权重",
+        help="客户端整体原型损失权重",
+    )
+    parser.add_argument(
+        "--prototype_contrastive_margin",
+        type=float,
+        default=0.0,
+        help="平均原型距离对比损失施加到真实类别距离上的 margin",
+    )
+    parser.add_argument(
+        "--lambda_proto_high",
+        type=float,
+        default=1.0,
+        help="原型损失中高置信 u_pool 单标签对齐项权重",
+    )
+    parser.add_argument(
+        "--lambda_proto_low",
+        type=float,
+        default=1.0,
+        help="原型损失中低置信候选集合项权重",
+    )
+    parser.add_argument(
+        "--proto_margin",
+        type=float,
+        default=0.5,
+        help="低置信样本相对原型距离的候选集合边界",
+    )
+    parser.add_argument(
+        "--proto_max_set_size",
+        type=int,
+        default=3,
+        help="允许参与集合损失的最大候选类别数",
     )
     parser.add_argument(
         "--T",
@@ -218,6 +260,18 @@ def args_parser():
         type=int,
         default=20,
         help="每轮服务端全局锚点优化步数",
+    )
+    parser.add_argument(
+        "--anchor_align_weight",
+        type=float,
+        default=1.0,
+        help="服务端锚点贴近聚合原型损失的权重",
+    )
+    parser.add_argument(
+        "--anchor_separation_weight",
+        type=float,
+        default=1.0,
+        help="服务端锚点类间分离损失的权重",
     )
     parser.add_argument(
         "--log_level",

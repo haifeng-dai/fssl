@@ -63,41 +63,6 @@ class IndexedEvalDataset(Dataset):
         return len(self.indices)
 
 
-def dist_contrastive_loss(
-    features,
-    prototypes,
-    targets,
-    margin=0.0,
-    temperature=1.0,
-):
-    """距离对比损失，支持单标签 ``[B]`` 或候选标签集合 ``[B, C]``。"""
-    single_label = targets.ndim == 1
-    candidate_mask = (
-        F.one_hot(targets, prototypes.size(0)).bool()
-        if single_label
-        else targets.to(device=features.device, dtype=torch.bool)
-    )
-    distances = torch.cdist(features, prototypes.to(features.device), p=2.0)
-    if margin:
-        distances = distances + candidate_mask.to(distances.dtype) * margin
-    logits = -distances / temperature
-    if single_label:
-        return F.cross_entropy(logits, targets)
-
-    valid = candidate_mask.any(dim=1)
-    if not valid.any():
-        return features.sum() * 0.0
-
-    valid_logits = logits[valid]
-    valid_candidates = candidate_mask[valid]
-    log_all = torch.logsumexp(valid_logits, dim=1)
-    log_positive = torch.logsumexp(
-        valid_logits.masked_fill(~valid_candidates, float("-inf")),
-        dim=1,
-    )
-    return (log_all - log_positive).sum() / features.size(0)
-
-
 class Global:
     def __init__(self, args):
         self.args = args
@@ -139,6 +104,14 @@ class Global:
         self.model.eval()
         model_correct = 0
         prototype_correct = 0
+        raw_rescued = 0
+        low_conf_total = 0
+        low_conf_model_wrong = 0
+        proto_rescued_low_conf = 0
+        model_topk_low_conf = [0, 0, 0]
+        proto_topk_low_conf = [0, 0, 0]
+        union_topk_low_conf = [0, 0, 0]
+        complement_low_conf = [0, 0, 0, 0]  # MM, MP, PM, PP
         prototypes = prototypes.to(self.device) if prototypes is not None else None
         valid = (
             prototype_mask.to(self.device).bool()
@@ -149,13 +122,11 @@ class Global:
             prototypes is not None and valid is not None and bool(valid.any())
         )
 
-        def nearest(features, centers, center_mask=None):
+        def nearest(features, centers):
             distances = torch.cdist(features, centers).square() / features.size(1)
-            if center_mask is not None:
-                distances = distances.masked_fill(
-                    ~center_mask.unsqueeze(0), float("inf")
-                )
-            return distances.argmin(dim=1)
+            return distances.masked_fill(~valid.unsqueeze(0), float("inf")).argmin(
+                dim=1
+            )
 
         for images, labels in DataLoader(dataset, batch_size=batch_size):
             images, labels = images.to(self.device), labels.to(self.device)
@@ -173,6 +144,31 @@ class Global:
                 proto_prediction = proto_order[:, 0]
                 prototype_is_correct = proto_prediction == labels
                 prototype_correct += prototype_is_correct.sum().item()
+                raw_rescued += (prototype_is_correct & ~model_is_correct).sum().item()
+
+                low_conf = confidence < self.args.threshold
+                low_wrong = low_conf & ~model_is_correct
+                low_conf_total += low_conf.sum().item()
+                low_conf_model_wrong += low_wrong.sum().item()
+                proto_rescued_low_conf += (
+                    (low_wrong & prototype_is_correct).sum().item()
+                )
+                model_order = logits.argsort(dim=1, descending=True)
+                for index, k in enumerate((1, 2, 3)):
+                    model_hits = (model_order[:, :k] == labels.unsqueeze(1)).any(dim=1)
+                    proto_hits = (proto_order[:, :k] == labels.unsqueeze(1)).any(dim=1)
+                    union_hits = model_hits | proto_hits
+                    model_topk_low_conf[index] += (model_hits & low_conf).sum().item()
+                    proto_topk_low_conf[index] += (proto_hits & low_conf).sum().item()
+                    union_topk_low_conf[index] += (union_hits & low_conf).sum().item()
+                mm = low_conf & model_is_correct & prototype_is_correct
+                mp = low_conf & model_is_correct & ~prototype_is_correct
+                pm = low_conf & ~model_is_correct & prototype_is_correct
+                pp = low_conf & ~model_is_correct & ~prototype_is_correct
+                complement_low_conf[0] += mm.sum().item()
+                complement_low_conf[1] += mp.sum().item()
+                complement_low_conf[2] += pm.sum().item()
+                complement_low_conf[3] += pp.sum().item()
 
         total = len(dataset)
         model_errors = total - model_correct
@@ -181,8 +177,64 @@ class Global:
             "global_test_raw_prototype_acc": (
                 prototype_correct / total if has_valid_prototypes else np.nan
             ),
-            "global_test_raw_prototype_correct_given_model_wrong": np.nan,
+            "global_test_raw_prototype_correct_given_model_wrong": (
+                raw_rescued / model_errors
+                if has_valid_prototypes and model_errors
+                else np.nan
+            ),
         }
+        if has_valid_prototypes and low_conf_total:
+            result.update(
+                {
+                    "global_test_low_conf_total": low_conf_total,
+                    "global_test_low_conf_model_wrong": low_conf_model_wrong,
+                    "global_test_proto_rescue_low_conf": (
+                        proto_rescued_low_conf / low_conf_model_wrong
+                        if low_conf_model_wrong
+                        else np.nan
+                    ),
+                    "global_test_proto_rescued_low_conf": proto_rescued_low_conf,
+                    "global_test_model_top1_low_conf": model_topk_low_conf[0]
+                    / low_conf_total,
+                    "global_test_model_top2_low_conf": model_topk_low_conf[1]
+                    / low_conf_total,
+                    "global_test_model_top3_low_conf": model_topk_low_conf[2]
+                    / low_conf_total,
+                    "global_test_proto_top1_low_conf": proto_topk_low_conf[0]
+                    / low_conf_total,
+                    "global_test_proto_top2_low_conf": proto_topk_low_conf[1]
+                    / low_conf_total,
+                    "global_test_proto_top3_low_conf": proto_topk_low_conf[2]
+                    / low_conf_total,
+                    "global_test_union_top2_low_conf": union_topk_low_conf[1]
+                    / low_conf_total,
+                    "global_test_union_top3_low_conf": union_topk_low_conf[2]
+                    / low_conf_total,
+                    "global_test_low_conf_MM": complement_low_conf[0],
+                    "global_test_low_conf_MP": complement_low_conf[1],
+                    "global_test_low_conf_PM": complement_low_conf[2],
+                    "global_test_low_conf_PP": complement_low_conf[3],
+                }
+            )
+        else:
+            for name in (
+                "low_conf_total",
+                "low_conf_model_wrong",
+                "proto_rescued_low_conf",
+                "model_top1_low_conf",
+                "model_top2_low_conf",
+                "model_top3_low_conf",
+                "proto_top1_low_conf",
+                "proto_top2_low_conf",
+                "proto_top3_low_conf",
+                "union_top2_low_conf",
+                "union_top3_low_conf",
+                "low_conf_MM",
+                "low_conf_MP",
+                "low_conf_PM",
+                "low_conf_PP",
+            ):
+                result[f"global_test_{name}"] = np.nan
         return result
 
     def download_params(self):
@@ -212,7 +264,7 @@ class Global:
 
 
 class Local:
-    """使用监督 CE、高置信伪标签 CE 和平均原型对比损失训练。"""
+    """仅用监督 CE 和高置信 KL 训练；原型不参与反向传播。"""
 
     def __init__(self, args, device=None):
         self.device = device or torch.device(
@@ -258,19 +310,13 @@ class Local:
         has_prototypes = (
             global_prototypes is not None and global_prototype_mask is not None
         )
-        training_prototypes = (
-            global_prototypes.to(self.device) if has_prototypes else None
-        )
+        prototypes = global_prototypes.to(self.device) if has_prototypes else None
         prototype_mask = (
             global_prototype_mask.to(self.device).bool() if has_prototypes else None
         )
-        set_size_hist = torch.zeros(args.num_classes + 1, device=self.device)
-        set_size_hits = torch.zeros(args.num_classes + 1, device=self.device)
-        low_total = 0
-        true_label_in_set = 0
         local_steps = int(len(u_pool_dataset) / args.batch_size_local_labeled_fixmatch)
 
-        for local_epoch in range(args.local_epochs):
+        for _ in range(args.local_epochs):
             labeled_iter, u_pool_iter = iter(labeled_loader), iter(u_pool_loader)
             for _ in range(local_steps):
                 try:
@@ -279,16 +325,15 @@ class Local:
                     labeled_iter = iter(labeled_loader)
                     inputs_x, targets_x = next(labeled_iter)
                 try:
-                    inputs_u_w, inputs_u_s, targets_u_groundtruth = next(u_pool_iter)
+                    inputs_u_w, inputs_u_s, _ = next(u_pool_iter)
                 except StopIteration:
                     u_pool_iter = iter(u_pool_loader)
-                    inputs_u_w, inputs_u_s, targets_u_groundtruth = next(u_pool_iter)
+                    inputs_u_w, inputs_u_s, _ = next(u_pool_iter)
 
                 inputs_x = inputs_x.to(self.device)
                 targets_x = targets_x.to(self.device)
                 inputs_u_w = inputs_u_w.to(self.device)
                 inputs_u_s = inputs_u_s.to(self.device)
-                targets_u_groundtruth = targets_u_groundtruth.to(self.device)
                 batch_size = inputs_x.size(0)
                 inputs = self.interleave(
                     torch.cat((inputs_x, inputs_u_w, inputs_u_s)),
@@ -298,7 +343,6 @@ class Local:
                 features = self.de_interleave(features, 2 * args.mu + 1)
                 logits = self.de_interleave(logits, 2 * args.mu + 1)
                 features_x = features[:batch_size]
-                features_u_w, features_u_s = features[batch_size:].chunk(2)
                 logits_x = logits[:batch_size]
                 logits_u_w, logits_u_s = logits[batch_size:].chunk(2)
                 supervised_loss = F.cross_entropy(logits_x, targets_x)
@@ -315,97 +359,25 @@ class Local:
                         | global_confidence.ge(args.threshold)
                     ).float()
 
+                student_probs = torch.softmax(logits_u_s, dim=-1).clamp_min(1e-10)
+                hard_targets = F.one_hot(
+                    pseudo_targets, num_classes=args.num_classes
+                ).float()
                 unsupervised_loss = (
-                    F.cross_entropy(
-                        logits_u_s,
-                        pseudo_targets,
-                        reduction="none",
+                    F.kl_div(student_probs.log(), hard_targets, reduction="none").sum(
+                        dim=-1
                     )
                     * mask
                 ).mean()
 
-                labeled_prototype_loss = torch.zeros((), device=self.device)
-                high_u_prototype_loss = torch.zeros((), device=self.device)
+                prototype_loss = torch.zeros((), device=self.device)
                 if has_prototypes:
-                    valid_classes = prototype_mask.nonzero(as_tuple=True)[0]
-                    class_remap = torch.full(
-                        (args.num_classes,),
-                        -1,
-                        dtype=torch.long,
-                        device=self.device,
-                    )
-                    class_remap[valid_classes] = torch.arange(
-                        valid_classes.numel(), device=self.device
-                    )
-
                     valid_labeled = prototype_mask[targets_x]
                     if valid_labeled.any():
-                        labeled_prototype_loss = dist_contrastive_loss(
+                        prototype_loss = F.mse_loss(
                             features_x[valid_labeled],
-                            training_prototypes[valid_classes],
-                            class_remap[targets_x[valid_labeled]],
-                            args.prototype_contrastive_margin,
+                            prototypes[targets_x[valid_labeled]],
                         )
-
-                    high_valid = mask.bool() & prototype_mask[pseudo_targets]
-                    if high_valid.any():
-                        accepted_loss = dist_contrastive_loss(
-                            features_u_s[high_valid],
-                            training_prototypes[valid_classes],
-                            class_remap[pseudo_targets[high_valid]],
-                            args.prototype_contrastive_margin,
-                        )
-                        high_u_prototype_loss = accepted_loss * (
-                            high_valid.sum() / high_valid.numel()
-                        )
-
-                low_u_prototype_loss = torch.zeros((), device=self.device)
-                if has_prototypes:
-                    low_mask = ~mask.bool()
-                    if low_mask.any():
-                        distances = torch.cdist(
-                            features_u_w[low_mask], training_prototypes, p=2.0
-                        )
-                        distances = distances.masked_fill(
-                            ~prototype_mask.unsqueeze(0), float("inf")
-                        )
-                        prototype_probs = torch.softmax(-distances / args.T, dim=1)
-                        candidate_mask = (
-                            prototype_probs >= (1.0 / args.num_classes)
-                        ) & prototype_mask.unsqueeze(0)
-                        best = prototype_probs.argmax(dim=1)
-                        candidate_mask[
-                            torch.arange(candidate_mask.size(0), device=self.device),
-                            best,
-                        ] = True
-                        low_u_prototype_loss = dist_contrastive_loss(
-                            features_u_s[low_mask],
-                            training_prototypes,
-                            candidate_mask,
-                            0.0,
-                            args.T,
-                        )
-                        set_sizes = candidate_mask.sum(dim=1)
-                        hits = candidate_mask.gather(
-                            1,
-                            targets_u_groundtruth[low_mask].unsqueeze(1),
-                        ).squeeze(1)
-                        set_size_hist += torch.bincount(
-                            set_sizes, minlength=args.num_classes + 1
-                        )
-                        set_size_hits += torch.bincount(
-                            set_sizes,
-                            weights=hits.float(),
-                            minlength=args.num_classes + 1,
-                        )
-                        low_total += int(low_mask.sum().item())
-                        true_label_in_set += int(hits.sum().item())
-
-                prototype_loss = (
-                    labeled_prototype_loss
-                    + args.lambda_proto_high * high_u_prototype_loss
-                    + args.lambda_proto_low * low_u_prototype_loss
-                )
 
                 loss = (
                     supervised_loss
@@ -428,12 +400,6 @@ class Local:
             prototypes,
             prototype_counts,
             time.perf_counter() - start,
-            {
-                "low_total": low_total,
-                "set_size_hist": set_size_hist.cpu().tolist(),
-                "set_size_hits": set_size_hits.cpu().tolist(),
-                "true_label_in_set": true_label_in_set,
-            },
         )
 
     @torch.no_grad()
@@ -480,7 +446,7 @@ class ClientTrainer:
         eval_labeled = IndexedEvalDataset(
             labeled_view.dataset, task.labeled_indices, transform
         )
-        params, prototypes, counts, elapsed, candidate_stats = self.local.train(
+        params, prototypes, counts, elapsed = self.local.train(
             task.args,
             labeled_view,
             unlabeled_view,
@@ -494,7 +460,6 @@ class ClientTrainer:
             "prototypes": prototypes,
             "prototype_counts": counts,
             "elapsed_seconds": elapsed,
-            "candidate_stats": candidate_stats,
         }
 
 
@@ -563,216 +528,6 @@ def prototype_norm_metrics(prototypes, valid_mask):
             prototypes[class_id].norm().item() if valid else np.nan
         )
     return metrics
-
-
-def prototype_geometry_log(prototypes, valid_mask):
-    """格式化原型间距离矩阵及其几何统计，供训练日志输出。"""
-    valid_indices = np.flatnonzero(np.asarray(valid_mask, dtype=bool))
-    if len(valid_indices) < 1:
-        return "无有效原型"
-
-    centers = prototypes[valid_indices]
-    distances = torch.cdist(centers, centers, p=2).cpu().numpy()
-    radii = centers.norm(dim=1).cpu().numpy()
-    lines = [
-        f"有效类别：{valid_indices.tolist()}",
-        "原型 L2 范数：[" + ", ".join(f"{value:.4f}" for value in radii) + "]",
-        "原型 L2 距离矩阵：\n"
-        + "\n".join(
-            "  [" + ", ".join(f"{value:.4f}" for value in row) + "]"
-            for row in distances
-        ),
-    ]
-    if len(valid_indices) > 1:
-        off_diagonal = distances[~np.eye(len(distances), dtype=bool)]
-        nearest = distances.copy()
-        np.fill_diagonal(nearest, np.inf)
-        lines.append(
-            "类间距离摘要：最小=%.4f，平均=%.4f，最大=%.4f，"
-            "最近邻平均=%.4f"
-            % (
-                off_diagonal.min(),
-                off_diagonal.mean(),
-                off_diagonal.max(),
-                nearest.min(axis=1).mean(),
-            )
-        )
-    return "\n".join(lines)
-
-
-@torch.no_grad()
-def prototype_class_radius_metrics(
-    model,
-    prototypes,
-    prototype_mask,
-    labeled_dataset,
-    unlabeled_dataset,
-    batch_size,
-    threshold,
-    temperature,
-    metric="l2",
-):
-    """计算三类样本相对聚合原型的 L2 距离统计。"""
-    device = next(model.parameters()).device
-    prototypes = prototypes.to(device)
-    valid = prototype_mask.to(device).bool()
-    distances_by_group = [[[] for _ in range(prototypes.size(0))] for _ in range(3)]
-
-    def collect(dataset, mode):
-        for images, labels in DataLoader(dataset, batch_size=batch_size):
-            images, labels = images.to(device), labels.to(device)
-            features, logits = model(images)
-            if mode == "labeled":
-                sample_labels = labels
-                correct = logits.argmax(dim=1) == labels
-            else:
-                probs = torch.softmax(logits / temperature, dim=-1)
-                confidence, sample_labels = probs.max(dim=1)
-                keep = confidence.ge(threshold)
-                if not keep.any():
-                    continue
-                features, sample_labels = features[keep], sample_labels[keep]
-                correct = None
-
-            keep_valid = valid[sample_labels]
-            if not keep_valid.any():
-                continue
-            features = features[keep_valid]
-            sample_labels = sample_labels[keep_valid]
-            if metric == "l2":
-                distances = (features - prototypes[sample_labels]).norm(dim=1)
-            else:
-                raise ValueError(f"不支持的原型距离：{metric}")
-            group = 0 if mode == "labeled" else 1
-            for class_id in sample_labels.unique().tolist():
-                distances_by_group[group][class_id].extend(
-                    distances[sample_labels == class_id].cpu().tolist()
-                )
-            if mode == "labeled":
-                correct = correct[keep_valid]
-                correct_labels = sample_labels[correct]
-                correct_distances = distances[correct]
-                for class_id in correct_labels.unique().tolist():
-                    distances_by_group[2][class_id].extend(
-                        correct_distances[correct_labels == class_id].cpu().tolist()
-                    )
-
-    collect(labeled_dataset, "labeled")
-    collect(unlabeled_dataset, "unlabeled")
-    # 第二组包含第一组有标签样本和高置信无标签样本。
-    for class_id in range(prototypes.size(0)):
-        distances_by_group[1][class_id] = (
-            distances_by_group[0][class_id] + distances_by_group[1][class_id]
-        )
-
-    stats = []
-    for group in distances_by_group:
-        group_stats = []
-        for values in group:
-            if not values:
-                group_stats.append(
-                    {
-                        key: np.nan
-                        for key in (
-                            "mean",
-                            "median",
-                            "max",
-                            "max90",
-                            "max30",
-                            "max50",
-                            "max70",
-                        )
-                    }
-                )
-                continue
-            values = np.sort(np.asarray(values))
-
-            def prefix_max(fraction):
-                count = max(1, int(np.ceil(fraction * len(values))))
-                return values[count - 1]
-
-            group_stats.append(
-                {
-                    "mean": values.mean(),
-                    "median": np.median(values),
-                    "max": values[-1],
-                    "max90": prefix_max(0.9),
-                    "max30": prefix_max(0.3),
-                    "max50": prefix_max(0.5),
-                    "max70": prefix_max(0.7),
-                }
-            )
-        stats.append(group_stats)
-    return stats
-
-
-def candidate_diagnostic_log(results, num_classes, hist_key, hits_key):
-    """汇总一个距离度量下的逐客户端及全局候选集合诊断。"""
-    client_lines, ratios, coverages, per_size_coverages = [], [], [], []
-    total_hist = np.zeros(num_classes + 1)
-    total_size_hits = np.zeros(num_classes + 1)
-    total_low = 0
-    for result in results:
-        stats = result.candidate_stats
-        low_total = stats["low_total"]
-        if not low_total:
-            client_lines.append(f"客户端 {result.client_id}：低置信=0")
-            continue
-        hist = np.asarray(stats[hist_key])
-        size_hits = np.asarray(stats[hits_key])
-        ratio = hist / low_total
-        per_size_coverage = np.divide(
-            size_hits,
-            hist,
-            out=np.full(num_classes + 1, np.nan),
-            where=hist > 0,
-        )
-        coverage = size_hits.sum() / low_total
-        client_lines.append(
-            f"客户端 {result.client_id}：低置信={low_total}，"
-            f"整体真实标签∈集合={coverage:.2%}\n"
-            f"  集合大小 0..{num_classes} 比例：{np.round(ratio, 4).tolist()}\n"
-            f"  集合大小 0..{num_classes} 覆盖率："
-            f"{np.round(per_size_coverage, 4).tolist()}"
-        )
-        ratios.append(ratio)
-        coverages.append(coverage)
-        per_size_coverages.append(per_size_coverage)
-        total_hist += hist
-        total_size_hits += size_hits
-        total_low += low_total
-    if not ratios:
-        return None
-
-    per_size_coverages = np.asarray(per_size_coverages)
-    valid_count = np.isfinite(per_size_coverages).sum(axis=0)
-    macro_size_coverage = np.divide(
-        np.nansum(per_size_coverages, axis=0),
-        valid_count,
-        out=np.full(num_classes + 1, np.nan),
-        where=valid_count > 0,
-    )
-    micro_size_coverage = np.divide(
-        total_size_hits,
-        total_hist,
-        out=np.full(num_classes + 1, np.nan),
-        where=total_hist > 0,
-    )
-    return (
-        "\n".join(client_lines)
-        + "\n客户端宏平均：\n"
-        + f"  集合大小 0..{num_classes} 比例："
-        + f"{np.round(np.mean(ratios, axis=0), 4).tolist()}\n"
-        + f"  集合大小 0..{num_classes} 覆盖率："
-        + f"{np.round(macro_size_coverage, 4).tolist()}\n"
-        + f"  整体真实标签∈集合：{np.mean(coverages):.2%}\n"
-        + f"样本微平均（总低置信={total_low}）：\n"
-        + f"  集合大小 0..{num_classes} 比例："
-        + f"{np.round(total_hist / total_low, 4).tolist()}\n"
-        + f"  集合大小 0..{num_classes} 覆盖率："
-        + f"{np.round(micro_size_coverage, 4).tolist()}\n"
-        + f"  整体真实标签∈集合：{total_size_hits.sum() / total_low:.2%}"
-    )
 
 
 def fedavg_fixmatch(alpha, args=None):
@@ -857,7 +612,7 @@ def fedavg_fixmatch(alpha, args=None):
             for client in online_clients
         ]
         results = worker_pool.run_round(tasks)
-        sample_counts = [result.num_samples for result in results]
+
         global_prototypes, global_prototype_mask = server.aggregate_prototypes(
             [result.prototypes for result in results],
             [result.prototype_counts for result in results],
@@ -867,7 +622,7 @@ def fedavg_fixmatch(alpha, args=None):
         norm_metrics = prototype_norm_metrics(global_prototypes, global_prototype_mask)
         aggregated_params = server.aggregate(
             [result.params for result in results],
-            sample_counts,
+            [result.num_samples for result in results],
         )
 
         selected_labeled_indices = np.concatenate(
@@ -924,9 +679,9 @@ def fedavg_fixmatch(alpha, args=None):
 
         logger.info(
             "第 %d 轮准确率：\n"
-            "  global_test  模型/平均原型：%s / %s\n"
-            "  labeled     模型/平均原型：%s / %s\n"
-            "  u_pool      模型/平均原型：%s / %s",
+            "  global_test  模型/原型：%s / %s\n"
+            "  labeled     模型/原型：%s / %s\n"
+            "  u_pool      模型/原型：%s / %s",
             round_id,
             display(test_metrics["global_test_acc"]),
             display(test_metrics["global_test_raw_prototype_acc"]),
@@ -936,7 +691,42 @@ def fedavg_fixmatch(alpha, args=None):
             display(client_metrics["u_pool_raw_prototype_acc"]),
         )
         logger.info(
-            "第 %d 轮各类平均原型 L2 范数：\n  %s",
+            "第 %d 轮模型错误但原型正确的比例：\n"
+            "  global_test：%s\n"
+            "  labeled：%s\n"
+            "  u_pool：%s",
+            round_id,
+            display(
+                test_metrics["global_test_raw_prototype_correct_given_model_wrong"]
+            ),
+            display(client_metrics["labeled_raw_prototype_correct_given_model_wrong"]),
+            display(client_metrics["u_pool_raw_prototype_correct_given_model_wrong"]),
+        )
+        logger.info(
+            "第 %d 轮低置信原型互补诊断（u_pool）：低置信=%s，模型错误=%s，"
+            "原型救回=%s，救回率=%s；模型 Top1/2/3=%s/%s/%s；"
+            "原型 Top1/2/3=%s/%s/%s；并集 Top2/3=%s/%s；"
+            "互补 MM/MP/PM/PP=%s/%s/%s/%s",
+            round_id,
+            client_metrics["u_pool_low_conf_total"],
+            client_metrics["u_pool_low_conf_model_wrong"],
+            client_metrics["u_pool_proto_rescued_low_conf"],
+            display(client_metrics["u_pool_proto_rescue_low_conf"]),
+            display(client_metrics["u_pool_model_top1_low_conf"]),
+            display(client_metrics["u_pool_model_top2_low_conf"]),
+            display(client_metrics["u_pool_model_top3_low_conf"]),
+            display(client_metrics["u_pool_proto_top1_low_conf"]),
+            display(client_metrics["u_pool_proto_top2_low_conf"]),
+            display(client_metrics["u_pool_proto_top3_low_conf"]),
+            display(client_metrics["u_pool_union_top2_low_conf"]),
+            display(client_metrics["u_pool_union_top3_low_conf"]),
+            client_metrics["u_pool_low_conf_MM"],
+            client_metrics["u_pool_low_conf_MP"],
+            client_metrics["u_pool_low_conf_PM"],
+            client_metrics["u_pool_low_conf_PP"],
+        )
+        logger.info(
+            "第 %d 轮各类原型 L2 范数：\n  %s",
             round_id,
             np.round(
                 [
@@ -946,129 +736,6 @@ def fedavg_fixmatch(alpha, args=None):
                 4,
             ).tolist(),
         )
-        radius_metrics = None
-        if radius_metrics is not None:
-            stat_names = (
-                ("有标签", 0),
-                ("有标签+高置信无标签", 1),
-                ("预测正确有标签", 2),
-            )
-            metric_names = (
-                ("mean", "平均"),
-                ("median", "中位数"),
-                ("max", "最大值"),
-                ("max90", "前90%样本最大距离"),
-                ("max70", "前70%样本最大距离"),
-                ("max50", "前50%样本最大距离"),
-                ("max30", "前30%样本最大距离"),
-            )
-            radius_lines = []
-            for group_name, group_index in stat_names:
-                values = radius_metrics[group_index]
-                order = sorted(
-                    range(len(values)),
-                    key=lambda class_id: values[class_id]["max"],
-                    reverse=True,
-                )
-                sorted_values = [values[class_id] for class_id in order]
-                radius_lines.append(f"  {group_name}：")
-                radius_lines.append(f"    类别顺序（按最大值降序）：{order}")
-                for metric_name, metric_label in metric_names:
-                    radius_lines.append(
-                        f"    {metric_label}：["
-                        + ", ".join(
-                            f"{stats[metric_name]:.4f}" for stats in sorted_values
-                        )
-                        + "]"
-                    )
-            logger.info(
-                "第 %d 轮类内原型半径：\n%s",
-                round_id,
-                "\n".join(radius_lines),
-            )
-        candidate_results = [
-            result for result in results if result.candidate_stats is not None
-        ]
-        if candidate_results:
-            client_lines = []
-            ratios = []
-            coverages = []
-            per_size_coverages = []
-            total_hist = np.zeros(args.num_classes + 1)
-            total_size_hits = np.zeros(args.num_classes + 1)
-            total_low = total_hits = 0
-            for result in candidate_results:
-                stats = result.candidate_stats
-                low_total = stats["low_total"]
-                if not low_total:
-                    client_lines.append(f"客户端 {result.client_id}：低置信=0")
-                    continue
-                hist = np.asarray(stats["set_size_hist"])
-                ratio = hist / low_total
-                coverage = stats["true_label_in_set"] / low_total
-                size_hits = np.asarray(stats["set_size_hits"])
-                per_size_coverage = np.divide(
-                    size_hits,
-                    hist,
-                    out=np.full(args.num_classes + 1, np.nan),
-                    where=hist > 0,
-                )
-                client_lines.append(
-                    f"客户端 {result.client_id}：低置信={low_total}，"
-                    f"整体真实标签∈集合={coverage:.2%}\n"
-                    f"  集合大小 0..{args.num_classes} 比例："
-                    f"{np.round(ratio, 4).tolist()}\n"
-                    f"  集合大小 0..{args.num_classes} 覆盖率："
-                    f"{np.round(per_size_coverage, 4).tolist()}"
-                )
-                ratios.append(ratio)
-                coverages.append(coverage)
-                per_size_coverages.append(per_size_coverage)
-                total_hist += hist
-                total_size_hits += size_hits
-                total_low += low_total
-                total_hits += stats["true_label_in_set"]
-            if ratios:
-                size_coverage_array = np.asarray(per_size_coverages)
-                size_coverage_count = np.isfinite(size_coverage_array).sum(axis=0)
-                macro_size_coverage = np.divide(
-                    np.nansum(size_coverage_array, axis=0),
-                    size_coverage_count,
-                    out=np.full(args.num_classes + 1, np.nan),
-                    where=size_coverage_count > 0,
-                )
-                logger.info(
-                    "第 %d 轮原型概率 1/C 候选集合诊断：\n%s\n"
-                    "客户端宏平均：\n"
-                    "  集合大小 0..%d 比例：%s\n"
-                    "  集合大小 0..%d 覆盖率：%s\n"
-                    "  整体真实标签∈集合：%.2f%%\n"
-                    "样本微平均（总低置信=%d）：\n"
-                    "  集合大小 0..%d 比例：%s\n"
-                    "  集合大小 0..%d 覆盖率：%s\n"
-                    "  整体真实标签∈集合：%.2f%%",
-                    round_id,
-                    "\n".join(client_lines),
-                    args.num_classes,
-                    np.round(np.mean(ratios, axis=0), 4).tolist(),
-                    args.num_classes,
-                    np.round(macro_size_coverage, 4).tolist(),
-                    np.mean(coverages) * 100,
-                    total_low,
-                    args.num_classes,
-                    np.round(total_hist / total_low, 4).tolist(),
-                    args.num_classes,
-                    np.round(
-                        np.divide(
-                            total_size_hits,
-                            total_hist,
-                            out=np.full(args.num_classes + 1, np.nan),
-                            where=total_hist > 0,
-                        ),
-                        4,
-                    ).tolist(),
-                    total_hits / total_low * 100,
-                )
         progress.set_postfix(acc=f"{test_metrics['global_test_acc']:.2%}")
         if (
             round_id == 1

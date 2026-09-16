@@ -139,6 +139,14 @@ class Global:
         self.model.eval()
         model_correct = 0
         prototype_correct = 0
+        raw_rescued = 0
+        low_conf_total = 0
+        low_conf_model_wrong = 0
+        proto_rescued_low_conf = 0
+        model_topk_low_conf = [0, 0, 0]
+        proto_topk_low_conf = [0, 0, 0]
+        union_topk_low_conf = [0, 0, 0]
+        complement_low_conf = [0, 0, 0, 0]  # MM, MP, PM, PP
         prototypes = prototypes.to(self.device) if prototypes is not None else None
         valid = (
             prototype_mask.to(self.device).bool()
@@ -173,6 +181,31 @@ class Global:
                 proto_prediction = proto_order[:, 0]
                 prototype_is_correct = proto_prediction == labels
                 prototype_correct += prototype_is_correct.sum().item()
+                raw_rescued += (prototype_is_correct & ~model_is_correct).sum().item()
+            if has_valid_prototypes:
+                low_conf = confidence < self.args.threshold
+                low_wrong = low_conf & ~model_is_correct
+                low_conf_total += low_conf.sum().item()
+                low_conf_model_wrong += low_wrong.sum().item()
+                proto_rescued_low_conf += (
+                    (low_wrong & prototype_is_correct).sum().item()
+                )
+                model_order = logits.argsort(dim=1, descending=True)
+                for index, k in enumerate((1, 2, 3)):
+                    model_hits = (model_order[:, :k] == labels.unsqueeze(1)).any(dim=1)
+                    proto_hits = (proto_order[:, :k] == labels.unsqueeze(1)).any(dim=1)
+                    union_hits = model_hits | proto_hits
+                    model_topk_low_conf[index] += (model_hits & low_conf).sum().item()
+                    proto_topk_low_conf[index] += (proto_hits & low_conf).sum().item()
+                    union_topk_low_conf[index] += (union_hits & low_conf).sum().item()
+                mm = low_conf & model_is_correct & prototype_is_correct
+                mp = low_conf & model_is_correct & ~prototype_is_correct
+                pm = low_conf & ~model_is_correct & prototype_is_correct
+                pp = low_conf & ~model_is_correct & ~prototype_is_correct
+                complement_low_conf[0] += mm.sum().item()
+                complement_low_conf[1] += mp.sum().item()
+                complement_low_conf[2] += pm.sum().item()
+                complement_low_conf[3] += pp.sum().item()
 
         total = len(dataset)
         model_errors = total - model_correct
@@ -181,8 +214,64 @@ class Global:
             "global_test_raw_prototype_acc": (
                 prototype_correct / total if has_valid_prototypes else np.nan
             ),
-            "global_test_raw_prototype_correct_given_model_wrong": np.nan,
+            "global_test_raw_prototype_correct_given_model_wrong": (
+                raw_rescued / model_errors
+                if has_valid_prototypes and model_errors
+                else np.nan
+            ),
         }
+        if has_valid_prototypes and low_conf_total:
+            result.update(
+                {
+                    "global_test_low_conf_total": low_conf_total,
+                    "global_test_low_conf_model_wrong": low_conf_model_wrong,
+                    "global_test_proto_rescue_low_conf": (
+                        proto_rescued_low_conf / low_conf_model_wrong
+                        if low_conf_model_wrong
+                        else np.nan
+                    ),
+                    "global_test_proto_rescued_low_conf": proto_rescued_low_conf,
+                    "global_test_model_top1_low_conf": model_topk_low_conf[0]
+                    / low_conf_total,
+                    "global_test_model_top2_low_conf": model_topk_low_conf[1]
+                    / low_conf_total,
+                    "global_test_model_top3_low_conf": model_topk_low_conf[2]
+                    / low_conf_total,
+                    "global_test_proto_top1_low_conf": proto_topk_low_conf[0]
+                    / low_conf_total,
+                    "global_test_proto_top2_low_conf": proto_topk_low_conf[1]
+                    / low_conf_total,
+                    "global_test_proto_top3_low_conf": proto_topk_low_conf[2]
+                    / low_conf_total,
+                    "global_test_union_top2_low_conf": union_topk_low_conf[1]
+                    / low_conf_total,
+                    "global_test_union_top3_low_conf": union_topk_low_conf[2]
+                    / low_conf_total,
+                    "global_test_low_conf_MM": complement_low_conf[0],
+                    "global_test_low_conf_MP": complement_low_conf[1],
+                    "global_test_low_conf_PM": complement_low_conf[2],
+                    "global_test_low_conf_PP": complement_low_conf[3],
+                }
+            )
+        else:
+            for name in (
+                "low_conf_total",
+                "low_conf_model_wrong",
+                "proto_rescued_low_conf",
+                "model_top1_low_conf",
+                "model_top2_low_conf",
+                "model_top3_low_conf",
+                "proto_top1_low_conf",
+                "proto_top2_low_conf",
+                "proto_top3_low_conf",
+                "union_top2_low_conf",
+                "union_top3_low_conf",
+                "low_conf_MM",
+                "low_conf_MP",
+                "low_conf_PM",
+                "low_conf_PP",
+            ):
+                result[f"global_test_{name}"] = np.nan
         return result
 
     def download_params(self):
@@ -236,6 +325,7 @@ class Local:
         global_params,
         global_prototypes=None,
         global_prototype_mask=None,
+        global_prototype_max_radius=None,
     ):
         start = time.perf_counter()
         labeled_loader = DataLoader(
@@ -263,6 +353,15 @@ class Local:
         )
         prototype_mask = (
             global_prototype_mask.to(self.device).bool() if has_prototypes else None
+        )
+        prototype_max_radius = (
+            torch.as_tensor(
+                global_prototype_max_radius,
+                device=self.device,
+                dtype=torch.float32,
+            )
+            if has_prototypes and global_prototype_max_radius is not None
+            else None
         )
         set_size_hist = torch.zeros(args.num_classes + 1, device=self.device)
         set_size_hits = torch.zeros(args.num_classes + 1, device=self.device)
@@ -359,33 +458,30 @@ class Local:
                             high_valid.sum() / high_valid.numel()
                         )
 
-                low_u_prototype_loss = torch.zeros((), device=self.device)
-                if has_prototypes:
+                if (
+                    local_epoch + 1 == args.local_epochs
+                    and prototype_max_radius is not None
+                ):
                     low_mask = ~mask.bool()
                     if low_mask.any():
                         distances = torch.cdist(
                             features_u_w[low_mask], training_prototypes, p=2.0
                         )
-                        distances = distances.masked_fill(
-                            ~prototype_mask.unsqueeze(0), float("inf")
-                        )
-                        prototype_probs = torch.softmax(-distances / args.T, dim=1)
                         candidate_mask = (
-                            prototype_probs >= (1.0 / args.num_classes)
+                            distances <= prototype_max_radius.unsqueeze(0)
                         ) & prototype_mask.unsqueeze(0)
-                        best = prototype_probs.argmax(dim=1)
-                        candidate_mask[
-                            torch.arange(candidate_mask.size(0), device=self.device),
-                            best,
-                        ] = True
-                        low_u_prototype_loss = dist_contrastive_loss(
-                            features_u_s[low_mask],
-                            training_prototypes,
-                            candidate_mask,
-                            0.0,
-                            args.T,
-                        )
                         set_sizes = candidate_mask.sum(dim=1)
+                        # 单元素集合缺少候选比较信息；诊断时补入第二近的有效原型。
+                        if prototype_mask.sum() >= 2:
+                            singleton = set_sizes == 1
+                            if singleton.any():
+                                ordered_classes = distances.masked_fill(
+                                    ~prototype_mask.unsqueeze(0), float("inf")
+                                ).argsort(dim=1)
+                                candidate_mask[
+                                    singleton, ordered_classes[singleton, 1]
+                                ] = True
+                                set_sizes = candidate_mask.sum(dim=1)
                         hits = candidate_mask.gather(
                             1,
                             targets_u_groundtruth[low_mask].unsqueeze(1),
@@ -404,7 +500,6 @@ class Local:
                 prototype_loss = (
                     labeled_prototype_loss
                     + args.lambda_proto_high * high_u_prototype_loss
-                    + args.lambda_proto_low * low_u_prototype_loss
                 )
 
                 loss = (
@@ -433,7 +528,9 @@ class Local:
                 "set_size_hist": set_size_hist.cpu().tolist(),
                 "set_size_hits": set_size_hits.cpu().tolist(),
                 "true_label_in_set": true_label_in_set,
-            },
+            }
+            if prototype_max_radius is not None
+            else None,
         )
 
     @torch.no_grad()
@@ -488,6 +585,7 @@ class ClientTrainer:
             task.global_params,
             task.global_prototypes,
             task.global_prototype_mask,
+            task.global_prototype_max_radius,
         )
         return {
             "params": params,
@@ -610,9 +708,8 @@ def prototype_class_radius_metrics(
     batch_size,
     threshold,
     temperature,
-    metric="l2",
 ):
-    """计算三类样本相对聚合原型的 L2 距离统计。"""
+    """计算三类样本相对聚合原型的类内平均半径。"""
     device = next(model.parameters()).device
     prototypes = prototypes.to(device)
     valid = prototype_mask.to(device).bool()
@@ -639,10 +736,7 @@ def prototype_class_radius_metrics(
                 continue
             features = features[keep_valid]
             sample_labels = sample_labels[keep_valid]
-            if metric == "l2":
-                distances = (features - prototypes[sample_labels]).norm(dim=1)
-            else:
-                raise ValueError(f"不支持的原型距离：{metric}")
+            distances = (features - prototypes[sample_labels]).norm(dim=1)
             group = 0 if mode == "labeled" else 1
             for class_id in sample_labels.unique().tolist():
                 distances_by_group[group][class_id].extend(
@@ -706,75 +800,6 @@ def prototype_class_radius_metrics(
     return stats
 
 
-def candidate_diagnostic_log(results, num_classes, hist_key, hits_key):
-    """汇总一个距离度量下的逐客户端及全局候选集合诊断。"""
-    client_lines, ratios, coverages, per_size_coverages = [], [], [], []
-    total_hist = np.zeros(num_classes + 1)
-    total_size_hits = np.zeros(num_classes + 1)
-    total_low = 0
-    for result in results:
-        stats = result.candidate_stats
-        low_total = stats["low_total"]
-        if not low_total:
-            client_lines.append(f"客户端 {result.client_id}：低置信=0")
-            continue
-        hist = np.asarray(stats[hist_key])
-        size_hits = np.asarray(stats[hits_key])
-        ratio = hist / low_total
-        per_size_coverage = np.divide(
-            size_hits,
-            hist,
-            out=np.full(num_classes + 1, np.nan),
-            where=hist > 0,
-        )
-        coverage = size_hits.sum() / low_total
-        client_lines.append(
-            f"客户端 {result.client_id}：低置信={low_total}，"
-            f"整体真实标签∈集合={coverage:.2%}\n"
-            f"  集合大小 0..{num_classes} 比例：{np.round(ratio, 4).tolist()}\n"
-            f"  集合大小 0..{num_classes} 覆盖率："
-            f"{np.round(per_size_coverage, 4).tolist()}"
-        )
-        ratios.append(ratio)
-        coverages.append(coverage)
-        per_size_coverages.append(per_size_coverage)
-        total_hist += hist
-        total_size_hits += size_hits
-        total_low += low_total
-    if not ratios:
-        return None
-
-    per_size_coverages = np.asarray(per_size_coverages)
-    valid_count = np.isfinite(per_size_coverages).sum(axis=0)
-    macro_size_coverage = np.divide(
-        np.nansum(per_size_coverages, axis=0),
-        valid_count,
-        out=np.full(num_classes + 1, np.nan),
-        where=valid_count > 0,
-    )
-    micro_size_coverage = np.divide(
-        total_size_hits,
-        total_hist,
-        out=np.full(num_classes + 1, np.nan),
-        where=total_hist > 0,
-    )
-    return (
-        "\n".join(client_lines)
-        + "\n客户端宏平均：\n"
-        + f"  集合大小 0..{num_classes} 比例："
-        + f"{np.round(np.mean(ratios, axis=0), 4).tolist()}\n"
-        + f"  集合大小 0..{num_classes} 覆盖率："
-        + f"{np.round(macro_size_coverage, 4).tolist()}\n"
-        + f"  整体真实标签∈集合：{np.mean(coverages):.2%}\n"
-        + f"样本微平均（总低置信={total_low}）：\n"
-        + f"  集合大小 0..{num_classes} 比例："
-        + f"{np.round(total_hist / total_low, 4).tolist()}\n"
-        + f"  集合大小 0..{num_classes} 覆盖率："
-        + f"{np.round(micro_size_coverage, 4).tolist()}\n"
-        + f"  整体真实标签∈集合：{total_size_hits.sum() / total_low:.2%}"
-    )
-
-
 def fedavg_fixmatch(alpha, args=None):
     if args is None:
         args = args_parser()
@@ -836,6 +861,7 @@ def fedavg_fixmatch(alpha, args=None):
     metrics = []
     global_prototypes = None
     global_prototype_mask = None
+    global_prototype_max_radius = None
     all_clients = list(range(args.num_clients))
     progress = tqdm(range(1, args.num_rounds + 1), desc=args.method)
     for round_id in progress:
@@ -852,6 +878,7 @@ def fedavg_fixmatch(alpha, args=None):
                 global_params=params,
                 global_prototypes=global_prototypes,
                 global_prototype_mask=global_prototype_mask,
+                global_prototype_max_radius=global_prototype_max_radius,
                 args=copy.deepcopy(args),
             )
             for client in online_clients
@@ -908,6 +935,21 @@ def fedavg_fixmatch(alpha, args=None):
             global_prototypes,
             global_prototype_mask,
         )
+        radius_metrics = None
+        if global_prototypes is not None:
+            radius_metrics = prototype_class_radius_metrics(
+                server.model,
+                global_prototypes,
+                global_prototype_mask,
+                labeled_eval_dataset,
+                u_pool_eval_dataset,
+                args.batch_size_test,
+                args.threshold,
+                args.T,
+            )
+            global_prototype_max_radius = [
+                class_stats["max"] for class_stats in radius_metrics[1]
+            ]
         row = {
             "round": round_id,
             **test_metrics,
@@ -936,6 +978,29 @@ def fedavg_fixmatch(alpha, args=None):
             display(client_metrics["u_pool_raw_prototype_acc"]),
         )
         logger.info(
+            "第 %d 轮低置信原型互补诊断（u_pool）：低置信=%s，模型错误=%s，"
+            "原型救回=%s，救回率=%s；模型 Top1/2/3=%s/%s/%s；"
+            "原型 Top1/2/3=%s/%s/%s；并集 Top2/3=%s/%s；"
+            "互补 MM/MP/PM/PP=%s/%s/%s/%s",
+            round_id,
+            client_metrics["u_pool_low_conf_total"],
+            client_metrics["u_pool_low_conf_model_wrong"],
+            client_metrics["u_pool_proto_rescued_low_conf"],
+            display(client_metrics["u_pool_proto_rescue_low_conf"]),
+            display(client_metrics["u_pool_model_top1_low_conf"]),
+            display(client_metrics["u_pool_model_top2_low_conf"]),
+            display(client_metrics["u_pool_model_top3_low_conf"]),
+            display(client_metrics["u_pool_proto_top1_low_conf"]),
+            display(client_metrics["u_pool_proto_top2_low_conf"]),
+            display(client_metrics["u_pool_proto_top3_low_conf"]),
+            display(client_metrics["u_pool_union_top2_low_conf"]),
+            display(client_metrics["u_pool_union_top3_low_conf"]),
+            client_metrics["u_pool_low_conf_MM"],
+            client_metrics["u_pool_low_conf_MP"],
+            client_metrics["u_pool_low_conf_PM"],
+            client_metrics["u_pool_low_conf_PP"],
+        )
+        logger.info(
             "第 %d 轮各类平均原型 L2 范数：\n  %s",
             round_id,
             np.round(
@@ -946,7 +1011,11 @@ def fedavg_fixmatch(alpha, args=None):
                 4,
             ).tolist(),
         )
-        radius_metrics = None
+        logger.info(
+            "第 %d 轮原型几何诊断：\n%s",
+            round_id,
+            prototype_geometry_log(global_prototypes, global_prototype_mask),
+        )
         if radius_metrics is not None:
             stat_names = (
                 ("有标签", 0),
@@ -1038,7 +1107,7 @@ def fedavg_fixmatch(alpha, args=None):
                     where=size_coverage_count > 0,
                 )
                 logger.info(
-                    "第 %d 轮原型概率 1/C 候选集合诊断：\n%s\n"
+                    "第 %d 轮最大半径候选集合诊断（单元素集合补入第二近类别）：\n%s\n"
                     "客户端宏平均：\n"
                     "  集合大小 0..%d 比例：%s\n"
                     "  集合大小 0..%d 覆盖率：%s\n"

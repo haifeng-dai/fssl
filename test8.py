@@ -139,6 +139,14 @@ class Global:
         self.model.eval()
         model_correct = 0
         prototype_correct = 0
+        raw_rescued = 0
+        low_conf_total = 0
+        low_conf_model_wrong = 0
+        proto_rescued_low_conf = 0
+        model_topk_low_conf = [0, 0, 0]
+        proto_topk_low_conf = [0, 0, 0]
+        union_topk_low_conf = [0, 0, 0]
+        complement_low_conf = [0, 0, 0, 0]  # MM, MP, PM, PP
         prototypes = prototypes.to(self.device) if prototypes is not None else None
         valid = (
             prototype_mask.to(self.device).bool()
@@ -173,6 +181,31 @@ class Global:
                 proto_prediction = proto_order[:, 0]
                 prototype_is_correct = proto_prediction == labels
                 prototype_correct += prototype_is_correct.sum().item()
+                raw_rescued += (prototype_is_correct & ~model_is_correct).sum().item()
+            if has_valid_prototypes:
+                low_conf = confidence < self.args.threshold
+                low_wrong = low_conf & ~model_is_correct
+                low_conf_total += low_conf.sum().item()
+                low_conf_model_wrong += low_wrong.sum().item()
+                proto_rescued_low_conf += (
+                    (low_wrong & prototype_is_correct).sum().item()
+                )
+                model_order = logits.argsort(dim=1, descending=True)
+                for index, k in enumerate((1, 2, 3)):
+                    model_hits = (model_order[:, :k] == labels.unsqueeze(1)).any(dim=1)
+                    proto_hits = (proto_order[:, :k] == labels.unsqueeze(1)).any(dim=1)
+                    union_hits = model_hits | proto_hits
+                    model_topk_low_conf[index] += (model_hits & low_conf).sum().item()
+                    proto_topk_low_conf[index] += (proto_hits & low_conf).sum().item()
+                    union_topk_low_conf[index] += (union_hits & low_conf).sum().item()
+                mm = low_conf & model_is_correct & prototype_is_correct
+                mp = low_conf & model_is_correct & ~prototype_is_correct
+                pm = low_conf & ~model_is_correct & prototype_is_correct
+                pp = low_conf & ~model_is_correct & ~prototype_is_correct
+                complement_low_conf[0] += mm.sum().item()
+                complement_low_conf[1] += mp.sum().item()
+                complement_low_conf[2] += pm.sum().item()
+                complement_low_conf[3] += pp.sum().item()
 
         total = len(dataset)
         model_errors = total - model_correct
@@ -181,8 +214,64 @@ class Global:
             "global_test_raw_prototype_acc": (
                 prototype_correct / total if has_valid_prototypes else np.nan
             ),
-            "global_test_raw_prototype_correct_given_model_wrong": np.nan,
+            "global_test_raw_prototype_correct_given_model_wrong": (
+                raw_rescued / model_errors
+                if has_valid_prototypes and model_errors
+                else np.nan
+            ),
         }
+        if has_valid_prototypes and low_conf_total:
+            result.update(
+                {
+                    "global_test_low_conf_total": low_conf_total,
+                    "global_test_low_conf_model_wrong": low_conf_model_wrong,
+                    "global_test_proto_rescue_low_conf": (
+                        proto_rescued_low_conf / low_conf_model_wrong
+                        if low_conf_model_wrong
+                        else np.nan
+                    ),
+                    "global_test_proto_rescued_low_conf": proto_rescued_low_conf,
+                    "global_test_model_top1_low_conf": model_topk_low_conf[0]
+                    / low_conf_total,
+                    "global_test_model_top2_low_conf": model_topk_low_conf[1]
+                    / low_conf_total,
+                    "global_test_model_top3_low_conf": model_topk_low_conf[2]
+                    / low_conf_total,
+                    "global_test_proto_top1_low_conf": proto_topk_low_conf[0]
+                    / low_conf_total,
+                    "global_test_proto_top2_low_conf": proto_topk_low_conf[1]
+                    / low_conf_total,
+                    "global_test_proto_top3_low_conf": proto_topk_low_conf[2]
+                    / low_conf_total,
+                    "global_test_union_top2_low_conf": union_topk_low_conf[1]
+                    / low_conf_total,
+                    "global_test_union_top3_low_conf": union_topk_low_conf[2]
+                    / low_conf_total,
+                    "global_test_low_conf_MM": complement_low_conf[0],
+                    "global_test_low_conf_MP": complement_low_conf[1],
+                    "global_test_low_conf_PM": complement_low_conf[2],
+                    "global_test_low_conf_PP": complement_low_conf[3],
+                }
+            )
+        else:
+            for name in (
+                "low_conf_total",
+                "low_conf_model_wrong",
+                "proto_rescued_low_conf",
+                "model_top1_low_conf",
+                "model_top2_low_conf",
+                "model_top3_low_conf",
+                "proto_top1_low_conf",
+                "proto_top2_low_conf",
+                "proto_top3_low_conf",
+                "union_top2_low_conf",
+                "union_top3_low_conf",
+                "low_conf_MM",
+                "low_conf_MP",
+                "low_conf_PM",
+                "low_conf_PP",
+            ):
+                result[f"global_test_{name}"] = np.nan
         return result
 
     def download_params(self):
@@ -236,6 +325,8 @@ class Local:
         global_params,
         global_prototypes=None,
         global_prototype_mask=None,
+        global_prototype_max_radius=None,
+        global_prototype_max_cosine_distance=None,
     ):
         start = time.perf_counter()
         labeled_loader = DataLoader(
@@ -264,8 +355,28 @@ class Local:
         prototype_mask = (
             global_prototype_mask.to(self.device).bool() if has_prototypes else None
         )
+        prototype_max_radius = (
+            torch.as_tensor(
+                global_prototype_max_radius,
+                device=self.device,
+                dtype=torch.float32,
+            )
+            if has_prototypes and global_prototype_max_radius is not None
+            else None
+        )
+        prototype_max_cosine_distance = (
+            torch.as_tensor(
+                global_prototype_max_cosine_distance,
+                device=self.device,
+                dtype=torch.float32,
+            )
+            if has_prototypes and global_prototype_max_cosine_distance is not None
+            else None
+        )
         set_size_hist = torch.zeros(args.num_classes + 1, device=self.device)
         set_size_hits = torch.zeros(args.num_classes + 1, device=self.device)
+        cosine_set_size_hist = torch.zeros(args.num_classes + 1, device=self.device)
+        cosine_set_size_hits = torch.zeros(args.num_classes + 1, device=self.device)
         low_total = 0
         true_label_in_set = 0
         local_steps = int(len(u_pool_dataset) / args.batch_size_local_labeled_fixmatch)
@@ -359,33 +470,30 @@ class Local:
                             high_valid.sum() / high_valid.numel()
                         )
 
-                low_u_prototype_loss = torch.zeros((), device=self.device)
-                if has_prototypes:
+                if (
+                    local_epoch + 1 == args.local_epochs
+                    and prototype_max_radius is not None
+                ):
                     low_mask = ~mask.bool()
                     if low_mask.any():
                         distances = torch.cdist(
                             features_u_w[low_mask], training_prototypes, p=2.0
                         )
-                        distances = distances.masked_fill(
-                            ~prototype_mask.unsqueeze(0), float("inf")
-                        )
-                        prototype_probs = torch.softmax(-distances / args.T, dim=1)
                         candidate_mask = (
-                            prototype_probs >= (1.0 / args.num_classes)
+                            distances <= prototype_max_radius.unsqueeze(0)
                         ) & prototype_mask.unsqueeze(0)
-                        best = prototype_probs.argmax(dim=1)
-                        candidate_mask[
-                            torch.arange(candidate_mask.size(0), device=self.device),
-                            best,
-                        ] = True
-                        low_u_prototype_loss = dist_contrastive_loss(
-                            features_u_s[low_mask],
-                            training_prototypes,
-                            candidate_mask,
-                            0.0,
-                            args.T,
-                        )
                         set_sizes = candidate_mask.sum(dim=1)
+                        # 单元素集合缺少候选比较信息；诊断时补入第二近的有效原型。
+                        if prototype_mask.sum() >= 2:
+                            singleton = set_sizes == 1
+                            if singleton.any():
+                                ordered_classes = distances.masked_fill(
+                                    ~prototype_mask.unsqueeze(0), float("inf")
+                                ).argsort(dim=1)
+                                candidate_mask[
+                                    singleton, ordered_classes[singleton, 1]
+                                ] = True
+                                set_sizes = candidate_mask.sum(dim=1)
                         hits = candidate_mask.gather(
                             1,
                             targets_u_groundtruth[low_mask].unsqueeze(1),
@@ -401,10 +509,43 @@ class Local:
                         low_total += int(low_mask.sum().item())
                         true_label_in_set += int(hits.sum().item())
 
+                        if prototype_max_cosine_distance is not None:
+                            normalized_features = F.normalize(features_u_w[low_mask], dim=1)
+                            normalized_prototypes = F.normalize(
+                                training_prototypes, dim=1
+                            )
+                            cosine_distances = 1 - normalized_features @ normalized_prototypes.T
+                            cosine_candidate_mask = (
+                                cosine_distances
+                                <= prototype_max_cosine_distance.unsqueeze(0)
+                            ) & prototype_mask.unsqueeze(0)
+                            cosine_set_sizes = cosine_candidate_mask.sum(dim=1)
+                            if prototype_mask.sum() >= 2:
+                                singleton = cosine_set_sizes == 1
+                                if singleton.any():
+                                    ordered_classes = cosine_distances.masked_fill(
+                                        ~prototype_mask.unsqueeze(0), float("inf")
+                                    ).argsort(dim=1)
+                                    cosine_candidate_mask[
+                                        singleton, ordered_classes[singleton, 1]
+                                    ] = True
+                                    cosine_set_sizes = cosine_candidate_mask.sum(dim=1)
+                            cosine_hits = cosine_candidate_mask.gather(
+                                1,
+                                targets_u_groundtruth[low_mask].unsqueeze(1),
+                            ).squeeze(1)
+                            cosine_set_size_hist += torch.bincount(
+                                cosine_set_sizes, minlength=args.num_classes + 1
+                            )
+                            cosine_set_size_hits += torch.bincount(
+                                cosine_set_sizes,
+                                weights=cosine_hits.float(),
+                                minlength=args.num_classes + 1,
+                            )
+
                 prototype_loss = (
                     labeled_prototype_loss
                     + args.lambda_proto_high * high_u_prototype_loss
-                    + args.lambda_proto_low * low_u_prototype_loss
                 )
 
                 loss = (
@@ -433,7 +574,11 @@ class Local:
                 "set_size_hist": set_size_hist.cpu().tolist(),
                 "set_size_hits": set_size_hits.cpu().tolist(),
                 "true_label_in_set": true_label_in_set,
-            },
+                "cosine_set_size_hist": cosine_set_size_hist.cpu().tolist(),
+                "cosine_set_size_hits": cosine_set_size_hits.cpu().tolist(),
+            }
+            if prototype_max_radius is not None
+            else None,
         )
 
     @torch.no_grad()
@@ -488,6 +633,8 @@ class ClientTrainer:
             task.global_params,
             task.global_prototypes,
             task.global_prototype_mask,
+            task.global_prototype_max_radius,
+            task.global_prototype_max_cosine_distance,
         )
         return {
             "params": params,
@@ -573,6 +720,8 @@ def prototype_geometry_log(prototypes, valid_mask):
 
     centers = prototypes[valid_indices]
     distances = torch.cdist(centers, centers, p=2).cpu().numpy()
+    cosine_similarity = F.normalize(centers, dim=1) @ F.normalize(centers, dim=1).T
+    cosine_similarity = cosine_similarity.cpu().numpy()
     radii = centers.norm(dim=1).cpu().numpy()
     lines = [
         f"有效类别：{valid_indices.tolist()}",
@@ -581,6 +730,11 @@ def prototype_geometry_log(prototypes, valid_mask):
         + "\n".join(
             "  [" + ", ".join(f"{value:.4f}" for value in row) + "]"
             for row in distances
+        ),
+        "原型余弦相似度矩阵：\n"
+        + "\n".join(
+            "  [" + ", ".join(f"{value:.4f}" for value in row) + "]"
+            for row in cosine_similarity
         ),
     ]
     if len(valid_indices) > 1:
@@ -595,6 +749,17 @@ def prototype_geometry_log(prototypes, valid_mask):
                 off_diagonal.mean(),
                 off_diagonal.max(),
                 nearest.min(axis=1).mean(),
+            )
+        )
+        cosine_off_diagonal = cosine_similarity[
+            ~np.eye(len(cosine_similarity), dtype=bool)
+        ]
+        lines.append(
+            "类间余弦相似度摘要：最小=%.4f，平均=%.4f，最大=%.4f"
+            % (
+                cosine_off_diagonal.min(),
+                cosine_off_diagonal.mean(),
+                cosine_off_diagonal.max(),
             )
         )
     return "\n".join(lines)
@@ -612,7 +777,7 @@ def prototype_class_radius_metrics(
     temperature,
     metric="l2",
 ):
-    """计算三类样本相对聚合原型的 L2 距离统计。"""
+    """计算三类样本相对聚合原型的 L2 或余弦距离统计。"""
     device = next(model.parameters()).device
     prototypes = prototypes.to(device)
     valid = prototype_mask.to(device).bool()
@@ -641,6 +806,10 @@ def prototype_class_radius_metrics(
             sample_labels = sample_labels[keep_valid]
             if metric == "l2":
                 distances = (features - prototypes[sample_labels]).norm(dim=1)
+            elif metric == "cosine":
+                distances = 1 - F.cosine_similarity(
+                    features, prototypes[sample_labels], dim=1
+                )
             else:
                 raise ValueError(f"不支持的原型距离：{metric}")
             group = 0 if mode == "labeled" else 1
@@ -836,6 +1005,8 @@ def fedavg_fixmatch(alpha, args=None):
     metrics = []
     global_prototypes = None
     global_prototype_mask = None
+    global_prototype_max_radius = None
+    global_prototype_max_cosine_distance = None
     all_clients = list(range(args.num_clients))
     progress = tqdm(range(1, args.num_rounds + 1), desc=args.method)
     for round_id in progress:
@@ -852,6 +1023,8 @@ def fedavg_fixmatch(alpha, args=None):
                 global_params=params,
                 global_prototypes=global_prototypes,
                 global_prototype_mask=global_prototype_mask,
+                global_prototype_max_radius=global_prototype_max_radius,
+                global_prototype_max_cosine_distance=global_prototype_max_cosine_distance,
                 args=copy.deepcopy(args),
             )
             for client in online_clients
@@ -908,6 +1081,36 @@ def fedavg_fixmatch(alpha, args=None):
             global_prototypes,
             global_prototype_mask,
         )
+        radius_metrics = None
+        cosine_radius_metrics = None
+        if global_prototypes is not None:
+            radius_metrics = prototype_class_radius_metrics(
+                server.model,
+                global_prototypes,
+                global_prototype_mask,
+                labeled_eval_dataset,
+                u_pool_eval_dataset,
+                args.batch_size_test,
+                args.threshold,
+                args.T,
+            )
+            global_prototype_max_radius = [
+                class_stats["max"] for class_stats in radius_metrics[1]
+            ]
+            cosine_radius_metrics = prototype_class_radius_metrics(
+                server.model,
+                global_prototypes,
+                global_prototype_mask,
+                labeled_eval_dataset,
+                u_pool_eval_dataset,
+                args.batch_size_test,
+                args.threshold,
+                args.T,
+                metric="cosine",
+            )
+            global_prototype_max_cosine_distance = [
+                class_stats["max"] for class_stats in cosine_radius_metrics[1]
+            ]
         row = {
             "round": round_id,
             **test_metrics,
@@ -936,6 +1139,29 @@ def fedavg_fixmatch(alpha, args=None):
             display(client_metrics["u_pool_raw_prototype_acc"]),
         )
         logger.info(
+            "第 %d 轮低置信原型互补诊断（u_pool）：低置信=%s，模型错误=%s，"
+            "原型救回=%s，救回率=%s；模型 Top1/2/3=%s/%s/%s；"
+            "原型 Top1/2/3=%s/%s/%s；并集 Top2/3=%s/%s；"
+            "互补 MM/MP/PM/PP=%s/%s/%s/%s",
+            round_id,
+            client_metrics["u_pool_low_conf_total"],
+            client_metrics["u_pool_low_conf_model_wrong"],
+            client_metrics["u_pool_proto_rescued_low_conf"],
+            display(client_metrics["u_pool_proto_rescue_low_conf"]),
+            display(client_metrics["u_pool_model_top1_low_conf"]),
+            display(client_metrics["u_pool_model_top2_low_conf"]),
+            display(client_metrics["u_pool_model_top3_low_conf"]),
+            display(client_metrics["u_pool_proto_top1_low_conf"]),
+            display(client_metrics["u_pool_proto_top2_low_conf"]),
+            display(client_metrics["u_pool_proto_top3_low_conf"]),
+            display(client_metrics["u_pool_union_top2_low_conf"]),
+            display(client_metrics["u_pool_union_top3_low_conf"]),
+            client_metrics["u_pool_low_conf_MM"],
+            client_metrics["u_pool_low_conf_MP"],
+            client_metrics["u_pool_low_conf_PM"],
+            client_metrics["u_pool_low_conf_PP"],
+        )
+        logger.info(
             "第 %d 轮各类平均原型 L2 范数：\n  %s",
             round_id,
             np.round(
@@ -946,7 +1172,11 @@ def fedavg_fixmatch(alpha, args=None):
                 4,
             ).tolist(),
         )
-        radius_metrics = None
+        logger.info(
+            "第 %d 轮原型几何诊断：\n%s",
+            round_id,
+            prototype_geometry_log(global_prototypes, global_prototype_mask),
+        )
         if radius_metrics is not None:
             stat_names = (
                 ("有标签", 0),
@@ -985,6 +1215,35 @@ def fedavg_fixmatch(alpha, args=None):
                 "第 %d 轮类内原型半径：\n%s",
                 round_id,
                 "\n".join(radius_lines),
+            )
+        if cosine_radius_metrics is not None:
+            cosine_lines = []
+            for group_name, group_index in (
+                ("有标签", 0),
+                ("有标签+高置信无标签", 1),
+                ("预测正确有标签", 2),
+            ):
+                values = cosine_radius_metrics[group_index]
+                order = sorted(
+                    range(len(values)),
+                    key=lambda class_id: values[class_id]["max"],
+                    reverse=True,
+                )
+                cosine_lines.append(f"  {group_name}：")
+                cosine_lines.append(f"    类别顺序（按最大余弦距离降序）：{order}")
+                for metric_name, metric_label in metric_names:
+                    cosine_lines.append(
+                        f"    {metric_label.replace('距离', '余弦距离')}：["
+                        + ", ".join(
+                            f"{values[class_id][metric_name]:.4f}"
+                            for class_id in order
+                        )
+                        + "]"
+                    )
+            logger.info(
+                "第 %d 轮类内原型余弦距离：\n%s",
+                round_id,
+                "\n".join(cosine_lines),
             )
         candidate_results = [
             result for result in results if result.candidate_stats is not None
@@ -1038,7 +1297,7 @@ def fedavg_fixmatch(alpha, args=None):
                     where=size_coverage_count > 0,
                 )
                 logger.info(
-                    "第 %d 轮原型概率 1/C 候选集合诊断：\n%s\n"
+                    "第 %d 轮最大半径候选集合诊断（单元素集合补入第二近类别）：\n%s\n"
                     "客户端宏平均：\n"
                     "  集合大小 0..%d 比例：%s\n"
                     "  集合大小 0..%d 覆盖率：%s\n"
@@ -1068,6 +1327,19 @@ def fedavg_fixmatch(alpha, args=None):
                         4,
                     ).tolist(),
                     total_hits / total_low * 100,
+                )
+            cosine_log = candidate_diagnostic_log(
+                candidate_results,
+                args.num_classes,
+                "cosine_set_size_hist",
+                "cosine_set_size_hits",
+            )
+            if cosine_log is not None:
+                logger.info(
+                    "第 %d 轮最大余弦距离候选集合诊断"
+                    "（单元素集合补入第二近类别）：\n%s",
+                    round_id,
+                    cosine_log,
                 )
         progress.set_postfix(acc=f"{test_metrics['global_test_acc']:.2%}")
         if (

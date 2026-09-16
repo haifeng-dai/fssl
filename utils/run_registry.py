@@ -90,7 +90,7 @@ class Run:
         logger.info(
             "运行 %s 结束，最佳精度=%s，总耗时=%.1f 秒，平均每轮=%.1f 秒",
             self.run_id,
-            best_acc,
+            f"{best_acc:.2%}" if best_acc is not None else "—",
             total_seconds,
             total_seconds / num_rounds,
         )

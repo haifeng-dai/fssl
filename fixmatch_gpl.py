@@ -22,7 +22,7 @@ from Dataset.dataset import (
     show_clients_data_distribution,
 )
 from Dataset.sample_dirichlet import clients_indices, clients_indices_homo
-from Model.resnet import ResNet_PC
+from Model.factory import build_model
 from options import args_parser
 from utils.client_pool import (
     ClientTask,
@@ -46,15 +46,7 @@ class Global:
         self.device = torch.device(
             f"cuda:{self.gpu_id}" if torch.cuda.is_available() else "cpu"
         )
-        self.model = ResNet_PC(
-            resnet_size=8,
-            scaling=4,
-            save_activations=False,
-            group_norm_num_groups=None,
-            freeze_bn=False,
-            freeze_bn_affine=False,
-            num_classes=args.num_classes,
-        )
+        self.model = build_model(args)
         self.model.to(self.device)
 
     def aggregate(
@@ -119,32 +111,18 @@ class Global:
 class Local:
     """客户端训练器：以冻结的本轮全局模型提供 FixMatch 伪标签。"""
 
+    pseudo_label_mode = "global"
+
     def __init__(self, args, device=None):
         self.device = device or torch.device(
             f"cuda:{args.gpu_id}" if torch.cuda.is_available() else "cpu"
         )
 
-        self.local_model = ResNet_PC(
-            resnet_size=8,
-            scaling=4,
-            save_activations=False,
-            group_norm_num_groups=None,
-            freeze_bn=False,
-            freeze_bn_affine=False,
-            num_classes=args.num_classes,
-        )
+        self.local_model = build_model(args)
         self.local_model.to(self.device)
 
         # 与局部模型分离为两份实例：每轮由 global_params 刷新一次，随后保持冻结。
-        self.global_model = ResNet_PC(
-            resnet_size=8,
-            scaling=4,
-            save_activations=False,
-            group_norm_num_groups=None,
-            freeze_bn=False,
-            freeze_bn_affine=False,
-            num_classes=args.num_classes,
-        )
+        self.global_model = build_model(args)
         self.global_model.to(self.device)
 
         self.optimizer = SGD(
@@ -229,16 +207,38 @@ class Local:
                 logits = self.de_interleave(logits, 2 * args.mu + 1)
 
                 logits_x = logits[:batch_size]
-                _, logits_u_s = logits[batch_size:].chunk(2)
+                logits_u_w, logits_u_s = logits[batch_size:].chunk(2)
                 # 1. 有标签监督交叉熵损失
                 Lx = F.cross_entropy(logits_x, targets_x, reduction="mean")
 
-                # 2. 冻结的本轮全局模型在弱增强视图上生成伪标签。
+                # 2. 弱增强视图生成伪标签；GLPL 子类可同时使用局部和全局模型。
                 with torch.no_grad():
                     _, logits_u_w_global = self.global_model(inputs_u_w)
-                    pseudo_label = torch.softmax(logits_u_w_global / args.T, dim=-1)
-                    max_probs, targets_u = torch.max(pseudo_label, dim=-1)
-                    mask = max_probs.ge(args.threshold).float()
+                    global_probs = torch.softmax(logits_u_w_global / args.T, dim=-1)
+                    global_confidence, global_targets = global_probs.max(dim=-1)
+                    if self.pseudo_label_mode in {
+                        "combined",
+                        "combined_global",
+                        "combined_local",
+                    }:
+                        local_probs = torch.softmax(logits_u_w / args.T, dim=-1)
+                        local_confidence, local_targets = local_probs.max(dim=-1)
+                        if self.pseudo_label_mode == "combined_global":
+                            targets_u = global_targets
+                        elif self.pseudo_label_mode == "combined_local":
+                            targets_u = local_targets
+                        else:
+                            use_local = local_confidence >= global_confidence
+                            targets_u = torch.where(
+                                use_local, local_targets, global_targets
+                            )
+                        mask = (
+                            local_confidence.ge(args.threshold)
+                            | global_confidence.ge(args.threshold)
+                        ).float()
+                    else:
+                        targets_u = global_targets
+                        mask = global_confidence.ge(args.threshold).float()
 
                 # 3. 无标签强增强的一致性预测损失 (标准 CrossEntropy + 置信度阈值 Mask)
                 Lu = (
@@ -328,11 +328,13 @@ class ClientTrainer:
         }
 
 
-def fedavg_fixmatch(alpha, args=None):
+def fedavg_fixmatch(
+    alpha, args=None, trainer_cls=ClientTrainer, method="fixmatch_gpl"
+):
     """执行纯净的联邦半监督学习 (FedAvg + FixMatch)。"""
     if args is None:
         args = args_parser()
-    args.method = "fixmatch_gpl"
+    args.method = method
 
     if args.dataset == "CIFAR10":
         args.num_classes = 10
@@ -473,7 +475,7 @@ def fedavg_fixmatch(alpha, args=None):
         client_gpus,
         args,
         shared_dataset,
-        trainer_cls=ClientTrainer,
+        trainer_cls=trainer_cls,
         log_file=str(run.log_file),
     )
 

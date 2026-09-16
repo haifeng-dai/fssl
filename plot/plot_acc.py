@@ -180,10 +180,17 @@ def load_run_accuracy(run_path: str) -> tuple[list[float], list[float]]:
     with open(csv_path, newline="", encoding="utf8") as file:
         reader = csv.reader(file)
         header = next(reader, None)
-        if header is None or "acc" not in header:
-            raise ValueError(f"CSV must contain an 'acc' column: {csv_path}")
+        accuracy_column = (
+            "global_test_acc"
+            if header is not None and "global_test_acc" in header
+            else "acc"
+        )
+        if header is None or accuracy_column not in header:
+            raise ValueError(
+                f"CSV must contain a 'global_test_acc' or 'acc' column: {csv_path}"
+            )
         round_idx = header.index("round") if "round" in header else 0
-        acc_idx = header.index("acc")
+        acc_idx = header.index(accuracy_column)
 
         rounds: list[float] = []
         accs: list[float] = []
@@ -208,9 +215,7 @@ def aggregate_repeats(runs: list[dict]):
         common_rounds &= set(curve)
     common_rounds = sorted(common_rounds)
     if len(common_rounds) < max(len(curve) for curve in curves):
-        print(
-            f"注意：各重复轮数不一致，仅对 {len(common_rounds)} 个公共轮取均值/方差"
-        )
+        print(f"注意：各重复轮数不一致，仅对 {len(common_rounds)} 个公共轮取均值/方差")
     matrix = np.asarray([[curve[rd] for rd in common_rounds] for curve in curves])
     mean = matrix.mean(axis=0)
     std = matrix.std(axis=0, ddof=1) if len(curves) > 1 else np.zeros_like(mean)
@@ -223,7 +228,9 @@ def list_runs(filters: dict[str, object]) -> None:
     if not groups:
         print("No matching runs.")
         return
-    ordered = sorted(groups.items(), key=lambda item: group_latest_time(item[1]), reverse=True)
+    ordered = sorted(
+        groups.items(), key=lambda item: group_latest_time(item[1]), reverse=True
+    )
     print(
         f"{'group':<10} {'method':<18} {'α':<6} {'K':<4} {'lr':<6} "
         f"{'rounds':<8} {'repeats':<22} {'latest':<20} best_acc(mean±std)"
@@ -231,10 +238,12 @@ def list_runs(filters: dict[str, object]) -> None:
     for fingerprint, group in ordered:
         all_runs = [run for runs in group.values() for run in runs]
         params = all_runs[0]["params"]
-        repeat_desc = " ".join(
-            f"{repeat}:{latest_run(group[repeat])['status'] if latest_run(group[repeat]) else 'none'}"
-            for repeat in sorted(group)
-        )
+        repeat_statuses = []
+        for repeat in sorted(group):
+            latest = latest_run(group[repeat])
+            status = latest["status"] if latest is not None else "none"
+            repeat_statuses.append(f"{repeat}:{status}")
+        repeat_desc = " ".join(repeat_statuses)
         runs = selected_runs(group)
         best_accs = [run["best_acc"] for run in runs if run["best_acc"] is not None]
         if best_accs:
@@ -247,7 +256,7 @@ def list_runs(filters: dict[str, object]) -> None:
             best_desc = "-"
         latest_time = group_latest_time(group)
         print(
-            f"{fingerprint:<10} {str(params.get('method') or '-'):<18} "
+            f"{fingerprint:<10} {(params.get('method') or '-')!s:<18} "
             f"{params.get('alpha')!s:<6} {params.get('num_clients')!s:<4} "
             f"{params.get('lr_local_training')!s:<6} {params.get('num_rounds')!s:<8} "
             f"{repeat_desc:<22} {latest_time:<20} {best_desc}"
@@ -269,6 +278,7 @@ def plot_runs(
 
     fig, axis = plt.subplots(figsize=(9, 5.5), constrained_layout=True)
     plotted = 0
+    selected = []
 
     if individual:
         # 旧行为：每条 done 运行单独一条线。
@@ -280,10 +290,12 @@ def plot_runs(
             except (FileNotFoundError, ValueError) as error:
                 print(f"Skipping {row['run_id']}: {error}")
                 continue
-            label = run_label(row)
+            label = f"{run_label(row)} (max acc={np.nanmax(accs):.2f}%)"
             if suffix:
                 label += f" [{row['run_id'][:15]}]"
-            axis.plot(rounds, accs, marker="o", markersize=3, linewidth=1.8, label=label)
+            axis.plot(
+                rounds, accs, marker="o", markersize=3, linewidth=1.8, label=label
+            )
             plotted += 1
     else:
         # 组模式：取最新 N 个有 done 运行的组，每组画均值±标准差。
@@ -293,9 +305,7 @@ def plot_runs(
             for fingerprint, group in groups.items()
             if selected_runs(group)
         ]
-        plottable.sort(
-            key=lambda item: group_latest_time(item[1]), reverse=True
-        )
+        plottable.sort(key=lambda item: group_latest_time(item[1]), reverse=True)
         selected = plottable[: max(latest, 1)]
         if not selected:
             raise ValueError("No matching run has a usable metrics.csv.")
@@ -307,9 +317,11 @@ def plot_runs(
                 print(f"Skipping group {fingerprint}: {error}")
                 continue
             color = f"C{group_index % 10}"
-            label = group_label(runs)
+            label = f"{group_label(runs)} (max acc={np.nanmax(mean):.2f}%)"
             if len(runs) > 1:
-                axis.fill_between(rounds, mean - std, mean + std, color=color, alpha=0.18)
+                axis.fill_between(
+                    rounds, mean - std, mean + std, color=color, alpha=0.18
+                )
             for curve in curves:
                 per_rounds = sorted(curve)
                 axis.plot(
@@ -337,15 +349,13 @@ def plot_runs(
     axis.set_ylabel("Test Accuracy (%)")
     axis.grid(True, linestyle="--", alpha=0.45)
     axis.set_ylim(bottom=0)
-    if plotted > 1:
-        axis.legend()
+    if plotted > 0:
+        axis.legend(loc="lower right")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     name_parts = [str(filters.get("method") or "runs")]
-    for key in filters:
-        if key in filters:
-            value = filters[key]
-            name_parts.append(f"{key[0]}{value}" if key != "alpha" else f"a{value}")
+    for key, value in filters.items():
+        name_parts.append(f"{key[0]}{value}" if key != "alpha" else f"a{value}")
     if not individual:
         name_parts.append(f"grp{selected[0][0][:6]}")
         if len(selected) > 1:

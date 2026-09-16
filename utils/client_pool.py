@@ -4,7 +4,6 @@
 持有本地训练器），进程池的调度、结果收集与退出清理统一在这里处理。
 """
 
-import atexit
 import copy
 import dataclasses
 import gc
@@ -28,6 +27,14 @@ from utils.logging_setup import setup_logging
 
 logger = logging.getLogger(__name__)
 
+_ACTIVE_POOL = None
+
+
+def terminate_active_pool():
+    """立即终止主进程当前的客户端进程池。"""
+    if _ACTIVE_POOL is not None:
+        _ACTIVE_POOL.terminate()
+
 
 @dataclasses.dataclass
 class ClientTask:
@@ -38,6 +45,10 @@ class ClientTask:
     labeled_indices: list
     unlabeled_indices: list
     global_params: dict
+    global_prototypes: object | None = None
+    global_prototype_mask: object | None = None
+    global_prototype_max_radius: object | None = None
+    global_prototype_max_cosine_distance: object | None = None
     global_anchors: object | None = None
     global_class_dist: object | None = None
     args: object = None
@@ -56,6 +67,8 @@ class ClientResult:
     prototypes: object | None = None
     prototype_counts: object | None = None
     class_counts: object | None = None
+    eval_counts: object | None = None
+    candidate_stats: object | None = None
     elapsed_seconds: float = 0.0
     error: str | None = None
 
@@ -129,14 +142,7 @@ def client_worker(
                         **fields,
                     )
                 )
-            except (
-                RuntimeError,
-                ValueError,
-                TypeError,
-                KeyError,
-                IndexError,
-                AttributeError,
-            ) as exc:
+            except BaseException as exc:  # noqa: BLE001
                 result_queue.put(
                     ClientResult(
                         ok=False,
@@ -151,15 +157,7 @@ def client_worker(
                 # 每个任务结束（含失败）后清空本任务残留的显存缓存。
                 gc.collect()
                 torch.cuda.empty_cache()
-    except (
-        RuntimeError,
-        ValueError,
-        TypeError,
-        KeyError,
-        IndexError,
-        AttributeError,
-        OSError,
-    ) as exc:
+    except BaseException as exc:  # noqa: BLE001
         result_queue.put(
             ClientResult(
                 ok=False,
@@ -174,6 +172,10 @@ class ClientWorkerPool:
     """管理客户端训练进程池，支持多卡/单卡多进程调度。"""
 
     def __init__(self, gpu_ids, args, shared_dataset, trainer_cls, log_file=None):
+        global _ACTIVE_POOL
+        if _ACTIVE_POOL is not None and not _ACTIVE_POOL.closed:
+            raise RuntimeError("一个主进程只能创建一个 ClientWorkerPool")
+
         mp.set_sharing_strategy("file_system")
         self.gpu_ids = list(gpu_ids)
         self.args = copy.deepcopy(args)
@@ -182,7 +184,7 @@ class ClientWorkerPool:
         self.result_queue = self.ctx.Queue()
         self.processes = []
         self.closed = False
-        atexit.register(self.terminate)
+        _ACTIVE_POOL = self
 
         for gpu_id in self.gpu_ids:
             process = self.ctx.Process(
@@ -231,13 +233,11 @@ class ClientWorkerPool:
                         f"client {result.client_id} failed on GPU {result.gpu_id}:\n"
                         f"{result.error}"
                     )
-        except Exception as exc:
+        except BaseException:
             round_id = tasks[0].round if tasks else -1
             # 失败详情（含 traceback）写入运行日志文件，便于事后排查；
             # 随后保持原有抛出行为。
-            logger.exception(
-                "第 %d 轮收集客户端结果时失败", round_id
-            )
+            logger.exception("第 %d 轮收集客户端结果时失败", round_id)
             self.terminate()
             raise
 
@@ -245,48 +245,51 @@ class ClientWorkerPool:
 
     def close(self):
         """发送退出信号并回收所有 Worker。"""
+        global _ACTIVE_POOL
         if self.closed:
             return
         for _ in self.processes:
             self.task_queue.put(None)
         for process in self.processes:
             process.join()
+        self.task_queue.close()
+        self.result_queue.close()
         self.closed = True
+        if _ACTIVE_POOL is self:
+            _ACTIVE_POOL = None
 
     def terminate(self):
-        """强制终止并回收异常或未完成的 Worker。"""
+        """立即杀死并回收所有 Worker。"""
+        global _ACTIVE_POOL
         if self.closed:
             return
+        self.closed = True
         for process in self.processes:
-            if process.is_alive():
-                process.terminate()
-        for process in self.processes:
-            process.join(timeout=10)
-        for process in self.processes:
-            # SIGTERM 无效（如卡在不可中断的 CUDA 调用）时强制杀掉。
             if process.is_alive():
                 process.kill()
-            process.join()
-        # 读者已全部退出，放弃 flush 队列缓冲，否则解释器退出阶段可能永久阻塞。
-        for result_queue in (self.task_queue, self.result_queue):
-            result_queue.cancel_join_thread()
-            result_queue.close()
-        self.closed = True
+        for process in self.processes:
+            process.join(timeout=1)
+        for work_queue in (self.task_queue, self.result_queue):
+            work_queue.cancel_join_thread()
+            work_queue.close()
+        if _ACTIVE_POOL is self:
+            _ACTIVE_POOL = None
 
 
 def run_main(func):
-    """主进程入口包装：任何未捕获异常打印 traceback 后硬退出。
-
-    os._exit 绕开 atexit、队列 flush、CUDA 上下文清理等可能挂起的
-    退出流程，保证出错后整个进程树立即退出且退出码非零。
-    """
+    """主进程入口：异常或 Ctrl-C 时先回收 Worker，再硬退出。"""
 
     try:
         func()
     except SystemExit:
+        terminate_active_pool()
         raise
-    except BaseException:
+    except KeyboardInterrupt:
+        terminate_active_pool()
+        os._exit(130)
+    except BaseException:  # noqa: BLE001
         traceback.print_exc()
+        terminate_active_pool()
         os._exit(1)
 
 

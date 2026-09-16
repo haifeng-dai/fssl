@@ -23,7 +23,7 @@ from Dataset.dataset import (
     show_clients_data_distribution,
 )
 from Dataset.sample_dirichlet import clients_indices, clients_indices_homo
-from Model.resnet import ResNet_PC
+from Model.factory import build_model
 from options import args_parser
 from utils.client_pool import (
     ClientTask,
@@ -46,15 +46,7 @@ class Global:
         self.args = args
         self.gpu_id = args.server_gpu if args.server_gpu is not None else args.gpu_id
         self.device = torch.device(f"cuda:{self.gpu_id}")
-        self.model = ResNet_PC(
-            resnet_size=8,
-            scaling=4,
-            save_activations=False,
-            group_norm_num_groups=None,
-            freeze_bn=False,
-            freeze_bn_affine=False,
-            num_classes=args.num_classes,
-        )
+        self.model = build_model(args)
 
         self.model.to(self.device)
         self.num_classes = args.num_classes
@@ -253,25 +245,9 @@ class Local:
             f"cuda:{args.gpu_id}" if torch.cuda.is_available() else "cpu"
         )
 
-        self.local_model = ResNet_PC(
-            resnet_size=8,
-            scaling=4,
-            save_activations=False,
-            group_norm_num_groups=None,
-            freeze_bn=False,
-            freeze_bn_affine=False,
-            num_classes=args.num_classes,
-        )
+        self.local_model = build_model(args)
 
-        self.local_G = ResNet_PC(
-            resnet_size=8,
-            scaling=4,
-            save_activations=False,
-            group_norm_num_groups=None,
-            freeze_bn=False,
-            freeze_bn_affine=False,
-            num_classes=args.num_classes,
-        )
+        self.local_G = build_model(args)
 
         self.local_model.to(self.device)
         self.local_G.to(self.device)
@@ -687,7 +663,7 @@ class ClientTrainer:
         }
 
 
-def fixmatch(alpha, args=None):
+def fixmatch(alpha, args=None, global_cls=Global, method="proxyfl"):
     """执行完整的 ProxyFL：数据划分、并行本地训练、聚合、评估和保存。"""
 
     # ==================== 初始化参数和日志 ====================
@@ -773,7 +749,7 @@ def fixmatch(alpha, args=None):
         )
         sys.exit(1)
 
-    args.method = "proxyfl"
+    args.method = method
 
     # ==================== 注册实验运行（唯一目录 + SQLite 索引） ====================
     run = create_run(args)
@@ -840,7 +816,7 @@ def fixmatch(alpha, args=None):
     # ==================== 创建服务端和客户端 Worker ====================
     client_gpus = parse_worker_gpus(args, require_server_gpu_in_clients=True)
     args.gpu_id = args.server_gpu
-    global_model = Global(args)
+    global_model = global_cls(args)
     # 在创建共享数据集之前设置共享策略，避免预加载阶段产生大量文件描述符。
     mp.set_sharing_strategy("file_system")
     shared_dataset = preload_shared_dataset(data_local_training)
