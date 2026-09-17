@@ -50,7 +50,15 @@ FILTER_ARGS = {
 }
 
 # 计算组指纹时排除的参数：run 相关信息与随重复变化的量
-FINGERPRINT_EXCLUDE = {"run_id", "hostname", "git_commit", "seed", "repeat"}
+FINGERPRINT_EXCLUDE = {
+    "run_id",
+    "hostname",
+    "git_commit",
+    "git_diff",
+    "code",
+    "seed",
+    "repeat",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -224,9 +232,15 @@ def aggregate_repeats(runs: list[dict]):
 
 def list_runs(filters: dict[str, object]) -> None:
     rows = query(**filters) if filters else query()
+    # 过滤掉非 done 运行以及测试用的低轮数运行（rounds < 100）
+    rows = [
+        r
+        for r in rows
+        if r.get("status") == "done" and (r.get("num_rounds") or 0) >= 100
+    ]
     groups = group_runs(rows)
     if not groups:
-        print("No matching runs.")
+        print("No matching runs (filtered status=done, rounds>=100).")
         return
     ordered = sorted(
         groups.items(), key=lambda item: group_latest_time(item[1]), reverse=True
@@ -241,8 +255,10 @@ def list_runs(filters: dict[str, object]) -> None:
         repeat_statuses = []
         for repeat in sorted(group):
             latest = latest_run(group[repeat])
-            status = latest["status"] if latest is not None else "none"
-            repeat_statuses.append(f"{repeat}:{status}")
+            if latest is not None and latest.get("status") == "done":
+                repeat_statuses.append(f"{repeat}:done")
+        if not repeat_statuses:
+            continue
         repeat_desc = " ".join(repeat_statuses)
         runs = selected_runs(group)
         best_accs = [run["best_acc"] for run in runs if run["best_acc"] is not None]
@@ -270,9 +286,15 @@ def plot_runs(
     individual: bool = False,
 ) -> Path:
     rows = query(**filters)
+    # 过滤掉非 done 运行以及测试用的低轮数运行（rounds < 100）
+    rows = [
+        r
+        for r in rows
+        if r.get("status") == "done" and (r.get("num_rounds") or 0) >= 100
+    ]
     if not rows:
         raise ValueError(
-            "No runs match the given filters. "
+            "No runs match the given filters (filtered status=done, rounds>=100). "
             "Run `python plot/plot_acc.py --list` to see what is available."
         )
 

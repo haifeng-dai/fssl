@@ -20,8 +20,8 @@ def args_parser():
     parser.add_argument(
         "--model",
         choices=("resnet", "cnn"),
-        default="cnn",
-        help="模型结构：cnn（默认）或 resnet",
+        default="resnet",
+        help="模型结构：resnet（默认）或 cnn",
     )
     parser.add_argument(
         "--cnn_feature_dim",
@@ -38,7 +38,7 @@ def args_parser():
     parser.add_argument(
         "--num_online_clients",
         type=int,
-        default=20,
+        default=8,
         help="每一轮通信中被随机选中参与训练的活跃客户端数量 (C*K)",
     )
     parser.add_argument(
@@ -96,7 +96,7 @@ def args_parser():
     parser.add_argument(
         "--gpu_processes",
         type=str,
-        default=None,
+        default="0:5,1:5,2:5,3:5",
         help="各 GPU 上分配的进程数配置 (格式为 GPU:进程数，如 '0:2,1:1' 表示 0号卡跑2进程，1号卡跑1进程)",
     )
 
@@ -154,7 +154,7 @@ def args_parser():
     parser.add_argument(
         "--prototype_contrastive_margin",
         type=float,
-        default=0.0,
+        default=10.0,
         help="平均原型距离对比损失施加到真实类别距离上的 margin",
     )
     parser.add_argument(
@@ -168,18 +168,6 @@ def args_parser():
         type=float,
         default=1.0,
         help="原型损失中低置信候选集合项权重",
-    )
-    parser.add_argument(
-        "--proto_margin",
-        type=float,
-        default=0.5,
-        help="低置信样本相对原型距离的候选集合边界",
-    )
-    parser.add_argument(
-        "--proto_max_set_size",
-        type=int,
-        default=3,
-        help="允许参与集合损失的最大候选类别数",
     )
     parser.add_argument(
         "--T",

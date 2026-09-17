@@ -171,8 +171,9 @@ class Local:
         num_high_corrects = 0
         pseudo_client_acc = 0.0
         u_client_valid = 0.0
-        # 每个本地 epoch 按无标签 DataLoader 的实际批次数训练。
-        local_iter = len(unlabeled_trainloader)
+        local_iter = int(
+            len(data_client_unlabeled) / args.batch_size_local_labeled_fixmatch
+        )
 
         for local_epoch in range(args.local_epochs):
             labeled_iter = iter(labeled_trainloader)

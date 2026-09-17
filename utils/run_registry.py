@@ -14,6 +14,7 @@ import secrets
 import socket
 import sqlite3
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -37,6 +38,8 @@ CREATE TABLE IF NOT EXISTS runs (
     best_acc     REAL,
     hostname     TEXT,
     git_commit   TEXT,
+    git_diff     TEXT,
+    code         TEXT,
     created_at   TEXT NOT NULL,
     finished_at  TEXT,
     params       TEXT NOT NULL
@@ -50,9 +53,54 @@ def _git_commit():
         return subprocess.check_output(
             ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True
         ).strip()
-    except subprocess.CalledProcessError, FileNotFoundError, OSError:
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
         # 非 git 仓库或 git 不可用时跳过，不影响实验运行
         return None
+
+
+def _git_diff():
+    """获取工作区未提交的代码 diff，非 git 仓库或无修改时返回 None。"""
+    try:
+        diff = subprocess.check_output(
+            ["git", "diff", "HEAD"], stderr=subprocess.DEVNULL, text=True
+        ).strip()
+        return diff if diff else None
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        return None
+
+
+def _get_entry_code(args) -> tuple[str | None, str | None]:
+    """获取当前正在运行的算法入口源码文本以及文件名。"""
+    # 1. 优先读取当前直接执行的主脚本（如 python sage.py ... 时的 sage.py）
+    if sys.argv:
+        try:
+            entry_path = Path(sys.argv[0]).resolve()
+            if entry_path.is_file() and entry_path.suffix == ".py":
+                return entry_path.read_text(encoding="utf8"), entry_path.name
+        except Exception:
+            pass
+
+    # 2. 备用尝试：根据 args.method 查找对应的脚本文件（如 proxyfl.py）
+    method = getattr(args, "method", None)
+    if method:
+        try:
+            method_path = Path(f"{method}.py").resolve()
+            if method_path.is_file():
+                return method_path.read_text(encoding="utf8"), method_path.name
+        except Exception:
+            pass
+
+    return None, None
+
+
+def _migrate_schema(conn: sqlite3.Connection):
+    """自动向现有 runs 表增量补充 code 和 git_diff 字段（兼容历史数据库）。"""
+    cursor = conn.execute("PRAGMA table_info(runs)")
+    existing_cols = {row[1] for row in cursor.fetchall()}
+    if "code" not in existing_cols:
+        conn.execute("ALTER TABLE runs ADD COLUMN code TEXT")
+    if "git_diff" not in existing_cols:
+        conn.execute("ALTER TABLE runs ADD COLUMN git_diff TEXT")
 
 
 def _connect():
@@ -60,6 +108,7 @@ def _connect():
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(_SCHEMA)
+    _migrate_schema(conn)
     return conn
 
 
@@ -129,6 +178,21 @@ def create_run(args) -> Run:
     with open(run_dir / "args.json", "w", encoding="utf8") as f:
         json.dump(snapshot, f, indent=2, ensure_ascii=False, default=str)
 
+    # 获取运行时的完整算法代码及当前未提交的 git diff 快照
+    code_text, code_filename = _get_entry_code(args)
+    git_diff_text = _git_diff()
+
+    # 在运行目录备份运行时的算法源码文件
+    if code_text is not None:
+        save_name = code_filename or "code.py"
+        with open(run_dir / save_name, "w", encoding="utf8") as f:
+            f.write(code_text)
+
+    # 在运行目录备份未提交的代码差异
+    if git_diff_text:
+        with open(run_dir / "git.patch", "w", encoding="utf8") as f:
+            f.write(git_diff_text)
+
     row = {
         "run_id": run_id,
         "path": str(run_dir),
@@ -142,6 +206,8 @@ def create_run(args) -> Run:
         "status": "running",
         "hostname": snapshot["hostname"],
         "git_commit": snapshot["git_commit"],
+        "git_diff": git_diff_text,
+        "code": code_text,
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "params": json.dumps(snapshot, ensure_ascii=False, default=str),
     }
@@ -172,7 +238,42 @@ def query(**filters):
     return rows
 
 
+def get_run_code(run_id_or_prefix: str) -> tuple[str | None, str | None]:
+    """根据 run_id 或其前缀查询该次运行时的算法代码及 git diff。
+
+    返回: (code_text, git_diff_text)
+    """
+    with _connect() as conn:
+        cursor = conn.execute(
+            "SELECT code, git_diff FROM runs WHERE run_id LIKE ? ORDER BY created_at DESC LIMIT 1",
+            (f"{run_id_or_prefix}%",),
+        )
+        row = cursor.fetchone()
+        if row:
+            return row[0], row[1]
+    return None, None
+
+
 if __name__ == "__main__":
+    import argparse
     import pprint
 
-    pprint.pprint(query())
+    parser = argparse.ArgumentParser(description="查看实验运行或导出历史代码快照")
+    parser.add_argument("--code", type=str, metavar="RUN_ID", help="打印指定 run_id 运行时的算法源码")
+    parser.add_argument("--diff", type=str, metavar="RUN_ID", help="打印指定 run_id 运行时的未提交 git diff")
+    cli_args = parser.parse_args()
+
+    if cli_args.code:
+        code, _ = get_run_code(cli_args.code)
+        if code:
+            print(code)
+        else:
+            print(f"未找到 run_id 前缀为 '{cli_args.code}' 的代码快照。")
+    elif cli_args.diff:
+        _, diff = get_run_code(cli_args.diff)
+        if diff:
+            print(diff)
+        else:
+            print(f"run_id '{cli_args.diff}' 无未提交 git diff 或未找到记录。")
+    else:
+        pprint.pprint(query())
