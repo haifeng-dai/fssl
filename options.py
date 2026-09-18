@@ -148,7 +148,7 @@ def args_parser():
     parser.add_argument(
         "--lambda_proto",
         type=float,
-        default=1.0,
+        default=0.1,
         help="客户端整体原型损失权重",
     )
     parser.add_argument(
@@ -261,6 +261,26 @@ def args_parser():
         default=1.0,
         help="服务端锚点类间分离损失的权重",
     )
+    parser.add_argument("--feddure_meta_lr", type=float, default=1e-3,
+                        help="FedDure 双调节器的元优化学习率")
+    parser.add_argument("--feddure_warmup_steps", type=int, default=10,
+                        help="FedDure 无标签损失系数的线性 warmup 步数")
+    parser.add_argument("--fedmatch_num_helpers", type=int, default=2,
+                        help="FedMatch 中每个客户端使用的相似 helper 数量")
+    parser.add_argument("--fedmatch_helper_interval", type=int, default=10,
+                        help="FedMatch 更新 helper 邻居的通信轮间隔")
+    parser.add_argument("--fedmatch_psi_factor", type=float, default=0.2,
+                        help="FedMatch 初始化时个体参数 ψ 相对共享参数 σ 的比例")
+    parser.add_argument("--fedmatch_lambda_i", type=float, default=1e-2,
+                        help="FedMatch 跨客户端 KL 一致性损失权重")
+    parser.add_argument("--fedmatch_lambda_a", type=float, default=1e-2,
+                        help="FedMatch 投票伪标签强增强 CE 损失权重")
+    parser.add_argument("--fedmatch_lambda_l1", type=float, default=1e-4,
+                        help="FedMatch ψ 的 L1 稀疏正则权重")
+    parser.add_argument("--fedmatch_lambda_l2", type=float, default=10.0,
+                        help="FedMatch σ 与 ψ 的 L2 分解正则权重")
+    parser.add_argument("--fedmatch_l1_threshold", type=float, default=5e-6,
+                        help="FedMatch 通信前将 |ψ| 小于此值的元素置零")
     parser.add_argument(
         "--log_level",
         type=str,

@@ -9,7 +9,7 @@ import torch
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 from torch.optim import SGD
-from torch.utils.data import DataLoader, Dataset, RandomSampler, TensorDataset
+from torch.utils.data import DataLoader, Dataset, RandomSampler
 from torchvision import datasets, transforms
 from tqdm import tqdm
 
@@ -33,11 +33,6 @@ from utils.logging_setup import log_args, setup_logging
 from utils.run_registry import create_run
 
 logger = logging.getLogger(__name__)
-
-# PLN 与服务端特定超参数
-SERVER_EPOCHS = 10
-PLN_WIDTH = 512
-PLN_DEPTH = 1
 
 DATASET_STATS = {
     "CIFAR10": ((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
@@ -68,37 +63,14 @@ class IndexedEvalDataset(Dataset):
         return len(self.indices)
 
 
-def dist_contrastive_loss(
-    features: torch.Tensor,
-    prototypes: torch.Tensor,
-    labels: torch.Tensor,
-    margin: float = 0.0,
-) -> torch.Tensor:
-    """服务端基于距离的原型对比损失，使各个类别的锚点相互分离。"""
-    device = features.device
-    num_classes = prototypes.shape[0]
-    dist = torch.cdist(features, prototypes.to(device), p=2.0)
-    if margin > 0:
-        one_hot = F.one_hot(labels, num_classes).to(device)
-        dist = dist + one_hot * margin
-    return F.cross_entropy(-dist, labels)
-
-
 def prototype_logits(
-    features: torch.Tensor, anchors: torch.Tensor, scale=1.0, temperature=1.0
+    features: torch.Tensor, anchors: torch.Tensor, temperature=1.0
 ) -> torch.Tensor:
-    """尺度归一化的原型 logits；较小温度使类别分布更尖锐。"""
+    """原型 logits；较小温度使类别分布更尖锐。"""
     feature_dim = features.size(1)
-    if isinstance(scale, torch.Tensor):
-        scale = scale.clamp_min(1e-6)
-    else:
-        scale = max(float(scale), 1e-6)
-    if isinstance(temperature, torch.Tensor):
-        temperature = temperature.to(features).clamp_min(1e-6)
-    else:
-        temperature = max(float(temperature), 1e-6)
+    temperature = torch.as_tensor(temperature, device=features.device).clamp_min(1e-6)
     distances = torch.cdist(features, anchors, p=2.0).square() / feature_dim
-    return -distances / (scale * temperature)
+    return -distances / temperature
 
 
 def prototype_set_loss(logits: torch.Tensor, label_sets: torch.Tensor) -> torch.Tensor:
@@ -107,60 +79,8 @@ def prototype_set_loss(logits: torch.Tensor, label_sets: torch.Tensor) -> torch.
     return torch.logsumexp(logits, dim=1) - torch.logsumexp(candidate_logits, dim=1)
 
 
-class PLN(torch.nn.Module):
-    def __init__(
-        self,
-        num_classes: int,
-        width: int = 512,
-        feature_dim: int = 512,
-        depth: int = 1,
-        fixed: int = 0,
-        init_emb: int = 0,
-    ):
-        super().__init__()
-        self.embedings = torch.nn.Embedding(num_classes, width)
-        self._init_embedings(init_emb)
-        if fixed:
-            self.embedings.weight.requires_grad = False
-        if depth < 1:
-            raise ValueError("depth must be at least 1")
-        self.middle = torch.nn.Sequential(
-            *[
-                torch.nn.Sequential(torch.nn.Linear(width, width), torch.nn.ReLU())
-                for _ in range(depth)
-            ]
-        )
-        self.fc = torch.nn.Linear(width, feature_dim)
-
-    def _init_embedings(self, init_emb: int):
-        initializers = {
-            1: lambda: torch.nn.init.uniform_(self.embedings.weight, -0.1, 0.1),
-            2: lambda: torch.nn.init.normal_(self.embedings.weight, mean=0.0, std=0.1),
-            3: lambda: torch.nn.init.normal_(self.embedings.weight, mean=0.0, std=0.01),
-            4: lambda: torch.nn.init.xavier_uniform_(self.embedings.weight),
-            5: lambda: torch.nn.init.xavier_normal_(self.embedings.weight),
-            6: lambda: torch.nn.init.kaiming_uniform_(
-                self.embedings.weight, nonlinearity="linear"
-            ),
-            7: lambda: torch.nn.init.orthogonal_(self.embedings.weight),
-        }
-        if init_emb not in initializers and init_emb != 0:
-            raise ValueError("Unknown init_emb value")
-        if init_emb in initializers:
-            initializers[init_emb]()
-
-    def forward(self, class_ids: torch.Tensor) -> torch.Tensor:
-        return self.fc(self.middle(self.embedings(class_ids)))
-
-
 class Global:
-    def __init__(
-        self,
-        args,
-        width_pln: int = PLN_WIDTH,
-        depth_pln: int = PLN_DEPTH,
-        server_epochs: int = SERVER_EPOCHS,
-    ):
+    def __init__(self, args):
         self.args = args
         gpu_id = args.server_gpu if args.server_gpu is not None else args.gpu_id
         self.device = torch.device(
@@ -168,22 +88,6 @@ class Global:
         )
         self.model = build_model(args).to(self.device)
         self.num_classes = args.num_classes
-        self.all_classes = torch.arange(args.num_classes, device=self.device)
-        self.server_epochs = server_epochs
-        self.pln = PLN(
-            num_classes=args.num_classes,
-            width=width_pln,
-            feature_dim=self.model.dim,
-            depth=depth_pln,
-            fixed=0,
-            init_emb=0,
-        ).to(self.device)
-        self.pln_optimizer = SGD(
-            self.pln.parameters(),
-            lr=getattr(args, "lr_server", 0.01),
-            momentum=0.9,
-            weight_decay=1e-4,
-        )
 
     def aggregate(self, local_params, sample_counts):
         result = copy.deepcopy(local_params[0])
@@ -218,53 +122,6 @@ class Global:
                 result[carry] = previous.to(self.device)[carry]
         return result.cpu()
 
-    def train_pln(self, uploaded_features: torch.Tensor, uploaded_labels: torch.Tensor):
-        """利用各客户端上传的原型及对应标签作为数据集，训练 PLN 网络分离类别锚点。"""
-        if uploaded_features.numel() == 0:
-            return 0.0, 0
-        self.pln.train()
-        dataset = TensorDataset(uploaded_features, uploaded_labels)
-        batch_size = min(len(dataset), max(1, getattr(self.args, "bs_server", 10)))
-        loader = DataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=True,
-            drop_last=False,
-        )
-        total_loss = 0.0
-        batches = 0
-        for _ in range(self.server_epochs):
-            for features, labels in loader:
-                features = features.to(self.device)
-                labels = labels.to(self.device)
-                current_prototypes = self.pln(self.all_classes)
-                loss = dist_contrastive_loss(
-                    features,
-                    current_prototypes,
-                    labels,
-                )
-                if torch.isnan(loss) or torch.isinf(loss):
-                    logger.warning("PLN 训练中 loss 为 NaN/Inf，跳过此 step")
-                    continue
-                self.pln_optimizer.zero_grad()
-                loss.backward()
-                self.pln_optimizer.step()
-                total_loss += loss.item()
-                batches += 1
-        avg_loss = total_loss / max(1, batches)
-        logger.info(
-            "服务端 PLN 训练完成：epoch=%d, 批次数=%d, 平均 loss=%.4f",
-            self.server_epochs,
-            batches,
-            avg_loss,
-        )
-        return total_loss, batches
-
-    @torch.no_grad()
-    def get_pln_prototypes(self):
-        self.pln.eval()
-        return self.pln(self.all_classes).detach().cpu()
-
     @torch.no_grad()
     def evaluate(
         self,
@@ -272,20 +129,21 @@ class Global:
         dataset,
         batch_size,
         raw_prototypes=None,
-        pln_prototypes=None,
+        prototype_mask=None,
     ):
-        """在测试集上评估分类头、原始聚合原型与 PLN 原型。"""
+        """在测试集上评估分类头与有效类别的聚合均值原型。"""
         self.model.load_state_dict(params)
         self.model.eval()
         model_correct = 0
         raw_correct = 0
-        pln_correct = 0
 
         raw_protos = (
             raw_prototypes.to(self.device) if raw_prototypes is not None else None
         )
-        pln_protos = (
-            pln_prototypes.to(self.device) if pln_prototypes is not None else None
+        valid_mask = (
+            prototype_mask.to(self.device, dtype=torch.bool)
+            if prototype_mask is not None
+            else None
         )
 
         for images, labels in DataLoader(dataset, batch_size=batch_size):
@@ -295,24 +153,22 @@ class Global:
             confidence, prediction = probs.max(dim=1)
             model_correct += (prediction == labels).sum().item()
 
-            if raw_protos is not None:
-                dist_raw = torch.cdist(features, raw_protos)
+            if raw_protos is not None and valid_mask is not None and valid_mask.any():
+                dist_raw = torch.cdist(features, raw_protos).masked_fill(
+                    ~valid_mask.unsqueeze(0), float("inf")
+                )
                 raw_pred = dist_raw.argmin(dim=1)
                 raw_correct += (raw_pred == labels).sum().item()
-
-            if pln_protos is not None:
-                dist_pln = torch.cdist(features, pln_protos)
-                pln_pred = dist_pln.argmin(dim=1)
-                pln_correct += (pln_pred == labels).sum().item()
 
         total = len(dataset)
         result = {
             "global_test_acc": model_correct / total,
             "global_test_raw_prototype_acc": (
-                raw_correct / total if raw_protos is not None else np.nan
-            ),
-            "global_test_pln_prototype_acc": (
-                pln_correct / total if pln_protos is not None else np.nan
+                raw_correct / total
+                if raw_protos is not None
+                and valid_mask is not None
+                and valid_mask.any()
+                else np.nan
             ),
         }
         return result
@@ -348,6 +204,7 @@ class Local:
         eval_labeled_dataset,
         global_params,
         global_prototypes=None,
+        global_prototype_mask=None,
     ):
         start = time.perf_counter()
         labeled_loader = DataLoader(
@@ -368,36 +225,14 @@ class Local:
         self.optimizer.state.clear()
         self.local_model.train()
 
-        has_prototypes = global_prototypes is not None
         training_prototypes = (
-            global_prototypes.to(self.device) if has_prototypes else None
+            global_prototypes.to(self.device) if global_prototypes is not None else None
         )
-        proto_scale = None
-        if has_prototypes and training_prototypes.size(0) >= 2:
-            feature_dim = training_prototypes.size(1)
-            pairwise_dists = (
-                torch.cdist(training_prototypes, training_prototypes, p=2).square()
-                / feature_dim
-            )
-            pair_mask = torch.triu(
-                torch.ones(
-                    training_prototypes.size(0),
-                    training_prototypes.size(0),
-                    dtype=torch.bool,
-                    device=self.device,
-                ),
-                diagonal=1,
-            )
-            if pair_mask.any():
-                proto_scale = (
-                    torch.quantile(pairwise_dists[pair_mask], 0.5)
-                    .clamp_min(1e-6)
-                    .detach()
-                )
-            else:
-                proto_scale = torch.tensor(1.0, device=self.device)
-        elif has_prototypes:
-            proto_scale = torch.tensor(1.0, device=self.device)
+        prototype_valid_mask = (
+            global_prototype_mask.to(self.device, dtype=torch.bool)
+            if global_prototype_mask is not None and training_prototypes is not None
+            else None
+        )
 
         local_steps = int(len(u_pool_dataset) / args.batch_size_local_labeled_fixmatch)
 
@@ -447,11 +282,10 @@ class Local:
                         | global_confidence.ge(args.threshold)
                     ).float()
 
-                    if has_prototypes and proto_scale is not None:
+                    if prototype_valid_mask is not None and prototype_valid_mask.any():
                         proto_logits_u = prototype_logits(
                             global_features_u_w.detach(),
-                            training_prototypes,
-                            proto_scale,
+                            training_prototypes[prototype_valid_mask],
                             args.proto_temperature,
                         )
                         relative_distances = (
@@ -477,13 +311,16 @@ class Local:
                 loss_proto_u = torch.zeros((), device=self.device)
                 loss_proto_l = torch.zeros((), device=self.device)
 
-                if has_prototypes:
+                if prototype_valid_mask is not None:
                     # 1. 有标签样本特征与对应真实类别的原型进行 MSE 对齐
-                    proto_targets_x = training_prototypes[targets_x]
-                    loss_proto_x = F.mse_loss(features_x, proto_targets_x)
+                    valid_x = prototype_valid_mask[targets_x]
+                    if valid_x.any():
+                        loss_proto_x = F.mse_loss(
+                            features_x[valid_x], training_prototypes[targets_x[valid_x]]
+                        )
 
                     # 2. 高置信度无标签样本特征与伪标签对应的原型进行 MSE 对齐
-                    high_mask = mask.bool()
+                    high_mask = mask.bool() & prototype_valid_mask[pseudo_targets]
                     if high_mask.any():
                         proto_targets_u = training_prototypes[pseudo_targets[high_mask]]
                         loss_proto_u = F.mse_loss(
@@ -497,8 +334,7 @@ class Local:
                             low_losses = prototype_set_loss(
                                 prototype_logits(
                                     features_u_s[low_valid],
-                                    training_prototypes,
-                                    proto_scale,
+                                    training_prototypes[prototype_valid_mask],
                                     args.proto_temperature,
                                 ),
                                 low_sets[low_valid],
@@ -585,6 +421,7 @@ class ClientTrainer:
             eval_labeled,
             task.global_params,
             task.global_prototypes,
+            task.global_prototype_mask,
         )
         return {
             "params": params,
@@ -634,7 +471,6 @@ def rename_dataset_metrics(metrics, prefix):
     return {
         f"{prefix}_global_model_acc": metrics["global_test_acc"],
         f"{prefix}_raw_prototype_acc": metrics["global_test_raw_prototype_acc"],
-        f"{prefix}_pln_prototype_acc": metrics["global_test_pln_prototype_acc"],
     }
 
 
@@ -653,7 +489,7 @@ def prototype_norm_metrics(prototypes, prefix="raw"):
 def fedavg_fixmatch(alpha, args=None):
     if args is None:
         args = args_parser()
-    args.method = "test_low"
+    args.method = "test_low_proto"
     train_dataset, test_dataset = load_datasets(args)
     run = create_run(args)
     setup_logging(run.log_file, level=args.log_level)
@@ -700,12 +536,7 @@ def fedavg_fixmatch(alpha, args=None):
 
     worker_gpus = parse_worker_gpus(args)
     args.gpu_id = args.server_gpu
-    server = Global(
-        args,
-        width_pln=PLN_WIDTH,
-        depth_pln=PLN_DEPTH,
-        server_epochs=SERVER_EPOCHS,
-    )
+    server = Global(args)
     mp.set_sharing_strategy("file_system")
     shared_dataset = preload_shared_dataset(train_dataset)
     worker_pool = ClientWorkerPool(
@@ -719,6 +550,7 @@ def fedavg_fixmatch(alpha, args=None):
     metrics = []
     global_prototypes = None
     raw_prototypes = None
+    prototype_mask = torch.zeros(args.num_classes, dtype=torch.bool)
     all_clients = list(range(args.num_clients))
     progress = tqdm(range(1, args.num_rounds + 1), desc=args.method)
     for round_id in progress:
@@ -734,6 +566,7 @@ def fedavg_fixmatch(alpha, args=None):
                 unlabeled_indices=list(np.asarray(client_unlabeled[client]).tolist()),
                 global_params=params,
                 global_prototypes=global_prototypes,
+                global_prototype_mask=prototype_mask,
                 args=copy.deepcopy(args),
             )
             for client in online_clients
@@ -748,30 +581,18 @@ def fedavg_fixmatch(alpha, args=None):
         )
 
         # 2. 聚合客户端原始原型 (供记录与对比)
+        round_prototype_mask = torch.stack(
+            [result.prototype_counts.to(torch.bool) for result in results]
+        ).any(dim=0)
         raw_prototypes = server.aggregate_prototypes(
             [result.prototypes for result in results],
             [result.prototype_counts for result in results],
             previous=raw_prototypes,
         )
+        prototype_mask |= round_prototype_mask
 
-        # 3. 收集所有客户端上传的带标签原型，在服务端训练 PLN 使得各个类别锚点相互分离
-        uploaded_features = []
-        uploaded_labels = []
-        for result in results:
-            client_protos = result.prototypes
-            client_counts = result.prototype_counts
-            for c in range(args.num_classes):
-                if client_counts[c] > 0:
-                    uploaded_features.append(client_protos[c])
-                    uploaded_labels.append(c)
-
-        if uploaded_features:
-            uploaded_features = torch.stack(uploaded_features)
-            uploaded_labels = torch.tensor(uploaded_labels, dtype=torch.long)
-            server.train_pln(uploaded_features, uploaded_labels)
-
-        # 4. 获取最新的全局 PLN 原型，供评估并在下一轮下发给各客户端
-        global_prototypes = server.get_pln_prototypes()
+        # 3. 直接下发有效类别的聚合均值原型。
+        global_prototypes = raw_prototypes
 
         # 5. 评估
         selected_labeled_indices = np.concatenate(
@@ -792,14 +613,14 @@ def fedavg_fixmatch(alpha, args=None):
             labeled_eval_dataset,
             args.batch_size_test,
             raw_prototypes=raw_prototypes,
-            pln_prototypes=global_prototypes,
+            prototype_mask=prototype_mask,
         )
         u_pool_metrics = server.evaluate(
             aggregated_params,
             u_pool_eval_dataset,
             args.batch_size_test,
             raw_prototypes=raw_prototypes,
-            pln_prototypes=global_prototypes,
+            prototype_mask=prototype_mask,
         )
         client_metrics = {
             **rename_dataset_metrics(labeled_metrics, "labeled"),
@@ -810,11 +631,10 @@ def fedavg_fixmatch(alpha, args=None):
             test_dataset,
             args.batch_size_test,
             raw_prototypes=raw_prototypes,
-            pln_prototypes=global_prototypes,
+            prototype_mask=prototype_mask,
         )
         norm_metrics = {
             **prototype_norm_metrics(raw_prototypes, prefix="raw"),
-            **prototype_norm_metrics(global_prototypes, prefix="pln"),
         }
         row = {
             "round": round_id,
@@ -832,33 +652,23 @@ def fedavg_fixmatch(alpha, args=None):
 
         logger.info(
             "第 %d 轮准确率：\n"
-            "  global_test  模型/均值原型/PLN：%s / %s / %s\n"
-            "  labeled     模型/均值原型/PLN：%s / %s / %s\n"
-            "  u_pool      模型/均值原型/PLN：%s / %s / %s",
+            "  global_test  模型/均值原型：%s / %s\n"
+            "  labeled     模型/均值原型：%s / %s\n"
+            "  u_pool      模型/均值原型：%s / %s",
             round_id,
             display(test_metrics["global_test_acc"]),
             display(test_metrics["global_test_raw_prototype_acc"]),
-            display(test_metrics["global_test_pln_prototype_acc"]),
             display(client_metrics["labeled_global_model_acc"]),
             display(client_metrics["labeled_raw_prototype_acc"]),
-            display(client_metrics["labeled_pln_prototype_acc"]),
             display(client_metrics["u_pool_global_model_acc"]),
             display(client_metrics["u_pool_raw_prototype_acc"]),
-            display(client_metrics["u_pool_pln_prototype_acc"]),
         )
         logger.info(
-            "第 %d 轮各类原型 L2 范数：\n  均值：%s\n  PLN：%s",
+            "第 %d 轮各类均值原型 L2 范数：%s",
             round_id,
             np.round(
                 [
                     norm_metrics.get(f"raw_prototype_l2_norm_class_{c}", np.nan)
-                    for c in range(args.num_classes)
-                ],
-                4,
-            ).tolist(),
-            np.round(
-                [
-                    norm_metrics.get(f"pln_prototype_l2_norm_class_{c}", np.nan)
                     for c in range(args.num_classes)
                 ],
                 4,

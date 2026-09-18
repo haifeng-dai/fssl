@@ -1121,12 +1121,18 @@ def fixmatch(alpha, args=None, global_cls=Global, method="proxyfl"):
             avg_data = float(np.mean([b["t_data"] for b in client_breakdowns]))
             avg_fwd_loc = float(np.mean([b["t_fwd_local"] for b in client_breakdowns]))
             avg_fwd_glob = float(np.mean([b["t_fwd_glob"] for b in client_breakdowns]))
-            avg_loss_fm = float(np.mean([b["t_loss_fixmatch"] for b in client_breakdowns]))
-            avg_loss_icpl = float(np.mean([b["t_loss_icpl"] for b in client_breakdowns]))
+            avg_loss_fm = float(
+                np.mean([b["t_loss_fixmatch"] for b in client_breakdowns])
+            )
+            avg_loss_icpl = float(
+                np.mean([b["t_loss_icpl"] for b in client_breakdowns])
+            )
             avg_bwd_opt = float(np.mean([b["t_bwd_opt"] for b in client_breakdowns]))
             avg_stats = float(np.mean([b["t_stats"] for b in client_breakdowns]))
         else:
-            avg_data = avg_fwd_loc = avg_fwd_glob = avg_loss_fm = avg_loss_icpl = avg_bwd_opt = avg_stats = 0.0
+            avg_data = avg_fwd_loc = avg_fwd_glob = avg_loss_fm = avg_loss_icpl = (
+                avg_bwd_opt
+            ) = avg_stats = 0.0
 
         logger.info(
             "第 %d 轮全局模型精度：%.2f%% (本轮总耗时: %.2fs)",
@@ -1151,8 +1157,7 @@ def fixmatch(alpha, args=None, global_cls=Global, method="proxyfl"):
             "     ├─ 全局类别分布更新: %.2fs\n"
             "     ├─ FedAvg 参数加权平均: %.2fs\n"
             "     └─ update_GPT (100轮代理优化): %.2fs\n"
-            "  3. 全局测试集评估 (fedavg_eval): %.2fs\n"
-            + "=" * 65,
+            "  3. 全局测试集评估 (fedavg_eval): %.2fs\n" + "=" * 65,
             r,
             t_round_total,
             t_client_wall,

@@ -9,7 +9,7 @@ import torch
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 from torch.optim import SGD
-from torch.utils.data import DataLoader, Dataset, RandomSampler
+from torch.utils.data import DataLoader, Dataset, RandomSampler, TensorDataset
 from torchvision import datasets, transforms
 from tqdm import tqdm
 
@@ -34,22 +34,17 @@ from utils.run_registry import create_run
 
 logger = logging.getLogger(__name__)
 
+# PLN 与服务端特定超参数
+SERVER_EPOCHS = 10
+PLN_WIDTH = 512
+PLN_DEPTH = 1
+
 DATASET_STATS = {
     "CIFAR10": ((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
     "CIFAR100": ((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)),
     "SVHN": ((0.4377, 0.4438, 0.4728), (0.1980, 0.2010, 0.1970)),
     "CINIC10": ((0.4789, 0.4723, 0.4305), (0.2421, 0.2383, 0.2587)),
 }
-
-
-def dist_contrastive_loss(
-    features: torch.Tensor,
-    prototypes: torch.Tensor,
-    labels: torch.Tensor,
-) -> torch.Tensor:
-    """以类别锚点为候选的距离交叉熵。"""
-    distances = torch.cdist(features, prototypes, p=2.0)
-    return F.cross_entropy(-distances, labels)
 
 
 def evaluation_transform(dataset):
@@ -73,8 +68,75 @@ class IndexedEvalDataset(Dataset):
         return len(self.indices)
 
 
+def dist_contrastive_loss(
+    features: torch.Tensor,
+    prototypes: torch.Tensor,
+    labels: torch.Tensor,
+    margin: float = 0.0,
+) -> torch.Tensor:
+    """服务端基于距离的原型对比损失，使各个类别的锚点相互分离。"""
+    device = features.device
+    num_classes = prototypes.shape[0]
+    dist = torch.cdist(features, prototypes.to(device), p=2.0)
+    if margin > 0:
+        one_hot = F.one_hot(labels, num_classes).to(device)
+        dist = dist + one_hot * margin
+    return F.cross_entropy(-dist, labels)
+
+
+class PLN(torch.nn.Module):
+    def __init__(
+        self,
+        num_classes: int,
+        width: int = 512,
+        feature_dim: int = 512,
+        depth: int = 1,
+        fixed: int = 0,
+        init_emb: int = 0,
+    ):
+        super().__init__()
+        self.embedings = torch.nn.Embedding(num_classes, width)
+        self._init_embedings(init_emb)
+        if fixed:
+            self.embedings.weight.requires_grad = False
+        if depth < 1:
+            raise ValueError("depth must be at least 1")
+        self.middle = torch.nn.Sequential(
+            *[
+                torch.nn.Sequential(torch.nn.Linear(width, width), torch.nn.ReLU())
+                for _ in range(depth)
+            ]
+        )
+        self.fc = torch.nn.Linear(width, feature_dim)
+
+    def _init_embedings(self, init_emb: int):
+        initializers = {
+            1: lambda: torch.nn.init.uniform_(self.embedings.weight, -0.1, 0.1),
+            2: lambda: torch.nn.init.normal_(self.embedings.weight, mean=0.0, std=0.1),
+            3: lambda: torch.nn.init.normal_(self.embedings.weight, mean=0.0, std=0.01),
+            4: lambda: torch.nn.init.xavier_uniform_(self.embedings.weight),
+            5: lambda: torch.nn.init.xavier_normal_(self.embedings.weight),
+            6: lambda: torch.nn.init.kaiming_uniform_(
+                self.embedings.weight, nonlinearity="linear"
+            ),
+            7: lambda: torch.nn.init.orthogonal_(self.embedings.weight),
+        }
+        if init_emb not in initializers and init_emb != 0:
+            raise ValueError("Unknown init_emb value")
+        if init_emb in initializers:
+            initializers[init_emb]()
+
+    def forward(self, class_ids: torch.Tensor) -> torch.Tensor:
+        return self.fc(self.middle(self.embedings(class_ids)))
+
+
 class Global:
-    def __init__(self, args):
+    def __init__(
+        self,
+        args,
+        width_pln: int = PLN_WIDTH,
+        depth_pln: int = PLN_DEPTH,
+    ):
         self.args = args
         gpu_id = args.server_gpu if args.server_gpu is not None else args.gpu_id
         self.device = torch.device(
@@ -82,6 +144,15 @@ class Global:
         )
         self.model = build_model(args).to(self.device)
         self.num_classes = args.num_classes
+        self.all_classes = torch.arange(args.num_classes, device=self.device)
+        self.pln = PLN(
+            num_classes=args.num_classes,
+            width=width_pln,
+            feature_dim=self.model.dim,
+            depth=depth_pln,
+            fixed=0,
+            init_emb=0,
+        ).to(self.device)
 
     def aggregate(self, local_params, sample_counts):
         result = copy.deepcopy(local_params[0])
@@ -116,81 +187,28 @@ class Global:
                 result[carry] = previous.to(self.device)[carry]
         return result.cpu()
 
-    def learn_anchors(
-        self,
-        initial_prototypes,
-        prototype_mask,
-        client_prototypes,
-        client_counts,
-        objective,
-    ):
-        """将聚合原型转为可训练锚点，并按指定目标在服务端优化。"""
-        valid_classes = prototype_mask.to(self.device, dtype=torch.bool).nonzero(
-            as_tuple=True
-        )[0]
-        if valid_classes.numel() == 0:
-            return initial_prototypes, {
-                "contrastive_loss": np.nan,
-                "classifier_loss": np.nan,
-            }
+    @torch.no_grad()
+    def get_pln_prototypes(self):
+        """生成 PLN 类别原型，并记录是否发生类别塌缩或 ReLU 死亡。"""
+        self.pln.eval()
+        embeddings = self.pln.embedings(self.all_classes)
+        middle_output = self.pln.middle(embeddings)
+        prototypes = self.pln.fc(middle_output)
 
-        anchor = torch.nn.Parameter(initial_prototypes.to(self.device).clone())
-        optimizer = SGD([anchor], lr=self.args.anchor_lr)
-        class_remap = torch.full(
-            (self.num_classes,), -1, dtype=torch.long, device=self.device
+        # `middle` 的末层为 ReLU；非零比例为 0 时，所有类别都会只剩 fc.bias。
+        active_fraction = (middle_output != 0).float().mean().item()
+        pairwise_distances = torch.pdist(prototypes)
+        classwise_std = prototypes.std(dim=0, unbiased=False).mean().item()
+        logger.info(
+            "PLN 健康度：middle 非零比例=%.2f%%，类别原型逐维 std=%.6f，"
+            "两两距离 min/mean/max=%.6f/%.6f/%.6f",
+            active_fraction * 100,
+            classwise_std,
+            pairwise_distances.min().item(),
+            pairwise_distances.mean().item(),
+            pairwise_distances.max().item(),
         )
-        class_remap[valid_classes] = torch.arange(
-            valid_classes.numel(), device=self.device
-        )
-        uploaded_features, uploaded_labels = [], []
-        for prototypes, counts in zip(client_prototypes, client_counts):
-            present = counts.to(self.device, dtype=torch.bool) & prototype_mask.to(
-                self.device, dtype=torch.bool
-            )
-            if present.any():
-                class_ids = present.nonzero(as_tuple=True)[0]
-                uploaded_features.append(prototypes.to(self.device)[class_ids])
-                uploaded_labels.append(class_remap[class_ids])
-
-        contrastive_loss = np.nan
-        if objective in {"contrastive", "hybrid"} and uploaded_features:
-            features = torch.cat(uploaded_features)
-            labels = torch.cat(uploaded_labels)
-            for _ in range(self.args.anchor_steps):
-                loss = dist_contrastive_loss(features, anchor[valid_classes], labels)
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-            contrastive_loss = loss.item()
-
-        classifier_loss = np.nan
-        if objective in {"classifier", "hybrid"}:
-            # FedAvg 分类器只提供固定的判别约束，梯度仅流向 anchor。
-            classifier = self.model.classifier
-            previous_requires_grad = [
-                param.requires_grad for param in classifier.parameters()
-            ]
-            try:
-                classifier.eval()
-                for param in classifier.parameters():
-                    param.requires_grad_(False)
-                labels = valid_classes
-                for _ in range(self.args.anchor_steps):
-                    loss = F.cross_entropy(classifier(anchor[valid_classes]), labels)
-                    optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
-                classifier_loss = loss.item()
-            finally:
-                for param, requires_grad in zip(
-                    classifier.parameters(), previous_requires_grad
-                ):
-                    param.requires_grad_(requires_grad)
-
-        return anchor.detach().cpu(), {
-            "contrastive_loss": contrastive_loss,
-            "classifier_loss": classifier_loss,
-        }
+        return prototypes.detach().cpu()
 
     @torch.no_grad()
     def evaluate(
@@ -198,18 +216,26 @@ class Global:
         params,
         dataset,
         batch_size,
-        anchors=None,
-        anchor_mask=None,
+        raw_prototypes=None,
+        pln_prototypes=None,
+        prototype_mask=None,
     ):
-        """在测试集上评估分类头和服务端训练后的类别锚点。"""
+        """在测试集上评估分类头、原始聚合原型与 PLN 原型。"""
         self.model.load_state_dict(params)
         self.model.eval()
         model_correct = 0
-        prototype_correct = 0
-        prototypes = anchors.to(self.device) if anchors is not None else None
-        prototype_mask = (
-            anchor_mask.to(self.device, dtype=torch.bool)
-            if anchor_mask is not None
+        raw_correct = 0
+        pln_correct = 0
+
+        raw_protos = (
+            raw_prototypes.to(self.device) if raw_prototypes is not None else None
+        )
+        pln_protos = (
+            pln_prototypes.to(self.device) if pln_prototypes is not None else None
+        )
+        valid_mask = (
+            prototype_mask.to(self.device, dtype=torch.bool)
+            if prototype_mask is not None
             else None
         )
 
@@ -217,28 +243,38 @@ class Global:
             images, labels = images.to(self.device), labels.to(self.device)
             features, logits = self.model(images)
             probs = torch.softmax(logits / self.args.T, dim=-1)
-            confidence, prediction = probs.max(dim=1)
+            _, prediction = probs.max(dim=1)
             model_correct += (prediction == labels).sum().item()
 
-            if (
-                prototypes is not None
-                and prototype_mask is not None
-                and prototype_mask.any()
-            ):
-                prototype_distances = torch.cdist(features, prototypes).masked_fill(
-                    ~prototype_mask.unsqueeze(0), float("inf")
+            if raw_protos is not None and valid_mask is not None and valid_mask.any():
+                dist_raw = torch.cdist(features, raw_protos).masked_fill(
+                    ~valid_mask.unsqueeze(0), float("inf")
                 )
-                prototype_pred = prototype_distances.argmin(dim=1)
-                prototype_correct += (prototype_pred == labels).sum().item()
+                raw_pred = dist_raw.argmin(dim=1)
+                raw_correct += (raw_pred == labels).sum().item()
+
+            if pln_protos is not None and valid_mask is not None and valid_mask.any():
+                dist_pln = torch.cdist(features, pln_protos).masked_fill(
+                    ~valid_mask.unsqueeze(0), float("inf")
+                )
+                pln_pred = dist_pln.argmin(dim=1)
+                pln_correct += (pln_pred == labels).sum().item()
 
         total = len(dataset)
         result = {
             "global_test_acc": model_correct / total,
-            "global_test_anchor_acc": (
-                prototype_correct / total
-                if prototypes is not None
-                and prototype_mask is not None
-                and prototype_mask.any()
+            "global_test_raw_prototype_acc": (
+                raw_correct / total
+                if raw_protos is not None
+                and valid_mask is not None
+                and valid_mask.any()
+                else np.nan
+            ),
+            "global_test_pln_prototype_acc": (
+                pln_correct / total
+                if pln_protos is not None
+                and valid_mask is not None
+                and valid_mask.any()
                 else np.nan
             ),
         }
@@ -250,6 +286,30 @@ class Global:
             for name, value in self.model.state_dict().items()
         }
 
+    def download_pln_params(self):
+        return {
+            name: value.detach().cpu().clone()
+            for name, value in self.pln.state_dict().items()
+        }
+
+    def aggregate_pln(self, local_params, sample_counts):
+        """服务端只按客户端 PLN 训练样本数做 FedAvg，不再训练 PLN。"""
+        result = copy.deepcopy(local_params[0])
+        total = sum(sample_counts)
+        for name, first in local_params[0].items():
+            if not torch.is_floating_point(first):
+                result[name] = first.clone()
+            else:
+                result[name] = (
+                    sum(
+                        params[name] * count
+                        for params, count in zip(local_params, sample_counts)
+                    )
+                    / total
+                )
+        self.pln.load_state_dict(result)
+        return result
+
 
 class Local:
     """使用监督 CE、高置信伪标签 CE 和全局原型 MSE 对齐训练。"""
@@ -260,11 +320,18 @@ class Local:
         )
         self.local_model = build_model(args).to(self.device)
         self.global_model = build_model(args).to(self.device)
+        self.pln = PLN(args.num_classes, PLN_WIDTH, self.local_model.dim, PLN_DEPTH).to(
+            self.device
+        )
+        self.all_classes = torch.arange(args.num_classes, device=self.device)
         self.optimizer = SGD(
             self.local_model.parameters(),
             lr=args.lr_local_training,
             momentum=0.9,
             weight_decay=1e-4,
+        )
+        self.pln_optimizer = SGD(
+            self.pln.parameters(), lr=args.lr_server, momentum=0.9, weight_decay=1e-4
         )
 
     def train(
@@ -276,6 +343,7 @@ class Local:
         global_params,
         global_prototypes=None,
         global_prototype_mask=None,
+        global_pln_params=None,
     ):
         start = time.perf_counter()
         labeled_loader = DataLoader(
@@ -292,6 +360,7 @@ class Local:
         )
         self.local_model.load_state_dict(global_params)
         self.global_model.load_state_dict(global_params)
+        self.pln.load_state_dict(global_pln_params)
         self.global_model.eval()
         self.optimizer.state.clear()
         self.local_model.train()
@@ -301,13 +370,13 @@ class Local:
         )
         prototype_valid_mask = (
             global_prototype_mask.to(self.device, dtype=torch.bool)
-            if global_prototype_mask is not None
+            if global_prototype_mask is not None and training_prototypes is not None
             else None
         )
 
         local_steps = int(len(u_pool_dataset) / args.batch_size_local_labeled_fixmatch)
 
-        for local_epoch in range(args.local_epochs):
+        for _ in range(args.local_epochs):
             labeled_iter, u_pool_iter = iter(labeled_loader), iter(u_pool_loader)
             for _ in range(local_steps):
                 try:
@@ -335,7 +404,7 @@ class Local:
                 features = self.de_interleave(features, 2 * args.mu + 1)
                 logits = self.de_interleave(logits, 2 * args.mu + 1)
                 features_x = features[:batch_size]
-                features_u_w, features_u_s = features[batch_size:].chunk(2)
+                _, features_u_s = features[batch_size:].chunk(2)
                 logits_x = logits[:batch_size]
                 logits_u_w, logits_u_s = logits[batch_size:].chunk(2)
 
@@ -365,12 +434,13 @@ class Local:
                 loss_proto_x = torch.zeros((), device=self.device)
                 loss_proto_u = torch.zeros((), device=self.device)
 
-                if training_prototypes is not None and prototype_valid_mask is not None:
+                if prototype_valid_mask is not None:
                     # 1. 有标签样本特征与对应真实类别的原型进行 MSE 对齐
                     valid_x = prototype_valid_mask[targets_x]
                     if valid_x.any():
-                        proto_targets_x = training_prototypes[targets_x[valid_x]]
-                        loss_proto_x = F.mse_loss(features_x[valid_x], proto_targets_x)
+                        loss_proto_x = F.mse_loss(
+                            features_x[valid_x], training_prototypes[targets_x[valid_x]]
+                        )
 
                     # 2. 高置信度无标签样本特征与伪标签对应的原型进行 MSE 对齐
                     high_mask = mask.bool() & prototype_valid_mask[pseudo_targets]
@@ -397,6 +467,9 @@ class Local:
         prototypes, prototype_counts = self.compute_prototypes(
             args, eval_labeled_dataset
         )
+        pln_params, pln_num_samples = self.train_local_pln(
+            args, labeled_dataset, u_pool_dataset
+        )
         params = {
             name: value.detach().cpu().clone()
             for name, value in self.local_model.state_dict().items()
@@ -405,7 +478,58 @@ class Local:
             params,
             prototypes,
             prototype_counts,
+            pln_params,
+            pln_num_samples,
             time.perf_counter() - start,
+        )
+
+    def train_local_pln(self, args, labeled_dataset, u_pool_dataset):
+        """第二阶段：固定已完成本地训练的模型，只用本地特征训练 PLN。"""
+        self.local_model.eval()
+        self.pln.train()
+        self.pln_optimizer.state.clear()
+        features, labels = [], []
+        with torch.no_grad():
+            for images, targets in DataLoader(
+                labeled_dataset, batch_size=args.batch_size_local_labeled_fixmatch
+            ):
+                feats, _ = self.local_model(images.to(self.device))
+                features.append(feats)
+                labels.append(targets.to(self.device))
+            for weak, _, _ in DataLoader(
+                u_pool_dataset,
+                batch_size=args.batch_size_local_labeled_fixmatch * args.mu,
+            ):
+                feats, logits = self.local_model(weak.to(self.device))
+                confidence, pseudo = torch.softmax(logits / args.T, dim=-1).max(dim=-1)
+                high = confidence.ge(args.threshold)
+                if high.any():
+                    features.append(feats[high])
+                    labels.append(pseudo[high])
+        features, labels = torch.cat(features), torch.cat(labels)
+        dataset = TensorDataset(features, labels)
+        loader = DataLoader(
+            dataset, batch_size=min(len(dataset), args.bs_server), shuffle=True
+        )
+        for _ in range(SERVER_EPOCHS):
+            for batch_features, batch_labels in loader:
+                loss = dist_contrastive_loss(
+                    batch_features,
+                    self.pln(self.all_classes),
+                    batch_labels,
+                )
+                self.pln_optimizer.zero_grad()
+                loss.backward()
+                self.pln_optimizer.step()
+        logger.debug(
+            "客户端 PLN 第二阶段：样本数=%d，最终 loss=%.6f", len(dataset), loss.item()
+        )
+        return (
+            {
+                name: value.detach().cpu().clone()
+                for name, value in self.pln.state_dict().items()
+            },
+            len(dataset),
         )
 
     @torch.no_grad()
@@ -452,19 +576,24 @@ class ClientTrainer:
         eval_labeled = IndexedEvalDataset(
             labeled_view.dataset, task.labeled_indices, transform
         )
-        params, prototypes, counts, elapsed = self.local.train(
-            task.args,
-            labeled_view,
-            unlabeled_view,
-            eval_labeled,
-            task.global_params,
-            task.global_prototypes,
-            task.global_prototype_mask,
+        params, prototypes, counts, pln_params, pln_num_samples, elapsed = (
+            self.local.train(
+                task.args,
+                labeled_view,
+                unlabeled_view,
+                eval_labeled,
+                task.global_params,
+                task.global_prototypes,
+                task.global_prototype_mask,
+                task.global_pln_params,
+            )
         )
         return {
             "params": params,
             "prototypes": prototypes,
             "prototype_counts": counts,
+            "pln_params": pln_params,
+            "pln_num_samples": pln_num_samples,
             "elapsed_seconds": elapsed,
         }
 
@@ -508,7 +637,8 @@ def rename_dataset_metrics(metrics, prefix):
     """把通用评估结果改成指定数据域的列名。"""
     return {
         f"{prefix}_global_model_acc": metrics["global_test_acc"],
-        f"{prefix}_anchor_acc": metrics["global_test_anchor_acc"],
+        f"{prefix}_raw_prototype_acc": metrics["global_test_raw_prototype_acc"],
+        f"{prefix}_pln_prototype_acc": metrics["global_test_pln_prototype_acc"],
     }
 
 
@@ -524,10 +654,10 @@ def prototype_norm_metrics(prototypes, prefix="raw"):
     return metrics
 
 
-def fedavg_fixmatch(alpha, args, anchor_objective):
+def fedavg_fixmatch(alpha, args=None):
     if args is None:
         args = args_parser()
-    args.method = f"test_anchor_{anchor_objective}"
+    args.method = "test_pln_2"
     train_dataset, test_dataset = load_datasets(args)
     run = create_run(args)
     setup_logging(run.log_file, level=args.log_level)
@@ -574,7 +704,11 @@ def fedavg_fixmatch(alpha, args, anchor_objective):
 
     worker_gpus = parse_worker_gpus(args)
     args.gpu_id = args.server_gpu
-    server = Global(args)
+    server = Global(
+        args,
+        width_pln=PLN_WIDTH,
+        depth_pln=PLN_DEPTH,
+    )
     mp.set_sharing_strategy("file_system")
     shared_dataset = preload_shared_dataset(train_dataset)
     worker_pool = ClientWorkerPool(
@@ -586,12 +720,14 @@ def fedavg_fixmatch(alpha, args, anchor_objective):
     )
 
     metrics = []
-    anchors = None
-    anchor_mask = torch.zeros(args.num_classes, dtype=torch.bool)
+    global_prototypes = None
+    raw_prototypes = None
+    prototype_mask = torch.zeros(args.num_classes, dtype=torch.bool)
     all_clients = list(range(args.num_clients))
     progress = tqdm(range(1, args.num_rounds + 1), desc=args.method)
     for round_id in progress:
         params = server.download_params()
+        pln_params = server.download_pln_params()
         online_clients = random_state.choice(
             all_clients, args.num_online_clients, replace=False
         )
@@ -602,8 +738,9 @@ def fedavg_fixmatch(alpha, args, anchor_objective):
                 labeled_indices=list(np.asarray(client_labeled[client]).tolist()),
                 unlabeled_indices=list(np.asarray(client_unlabeled[client]).tolist()),
                 global_params=params,
-                global_prototypes=anchors,
-                global_prototype_mask=anchor_mask,
+                global_prototypes=global_prototypes,
+                global_prototype_mask=prototype_mask,
+                global_pln_params=pln_params,
                 args=copy.deepcopy(args),
             )
             for client in online_clients
@@ -617,25 +754,32 @@ def fedavg_fixmatch(alpha, args, anchor_objective):
             sample_counts,
         )
 
-        # 2. 聚合原型后在服务端转化为可训练 anchor，并在下一轮下发。
-        round_anchor_mask = torch.stack(
+        # 2. 聚合客户端原始原型 (供记录与对比)
+        round_prototype_mask = torch.stack(
             [result.prototype_counts.to(torch.bool) for result in results]
         ).any(dim=0)
-        mean_prototypes = server.aggregate_prototypes(
+        raw_prototypes = server.aggregate_prototypes(
             [result.prototypes for result in results],
             [result.prototype_counts for result in results],
-            previous=anchors,
+            previous=raw_prototypes,
         )
-        anchor_mask |= round_anchor_mask
-        anchors, anchor_diagnostics = server.learn_anchors(
-            mean_prototypes,
-            anchor_mask,
-            [result.prototypes for result in results],
-            [result.prototype_counts for result in results],
-            anchor_objective,
+        prototype_mask |= round_prototype_mask
+
+        # 3. 服务端仅聚合客户端第二阶段训练得到的 PLN 参数。
+        server.aggregate_pln(
+            [result.pln_params for result in results],
+            [result.pln_num_samples for result in results],
+        )
+        logger.info(
+            "第 %d 轮客户端 PLN 聚合完成：每客户端第二阶段样本数=%s",
+            round_id,
+            [result.pln_num_samples for result in results],
         )
 
-        # 3. 评估
+        # 4. 获取最新的全局 PLN 原型，供评估并在下一轮下发给各客户端
+        global_prototypes = server.get_pln_prototypes()
+
+        # 5. 评估
         selected_labeled_indices = np.concatenate(
             [np.asarray(client_labeled[client]) for client in online_clients]
         )
@@ -653,15 +797,17 @@ def fedavg_fixmatch(alpha, args, anchor_objective):
             aggregated_params,
             labeled_eval_dataset,
             args.batch_size_test,
-            anchors=anchors,
-            anchor_mask=anchor_mask,
+            raw_prototypes=raw_prototypes,
+            pln_prototypes=global_prototypes,
+            prototype_mask=prototype_mask,
         )
         u_pool_metrics = server.evaluate(
             aggregated_params,
             u_pool_eval_dataset,
             args.batch_size_test,
-            anchors=anchors,
-            anchor_mask=anchor_mask,
+            raw_prototypes=raw_prototypes,
+            pln_prototypes=global_prototypes,
+            prototype_mask=prototype_mask,
         )
         client_metrics = {
             **rename_dataset_metrics(labeled_metrics, "labeled"),
@@ -671,18 +817,19 @@ def fedavg_fixmatch(alpha, args, anchor_objective):
             aggregated_params,
             test_dataset,
             args.batch_size_test,
-            anchors=anchors,
-            anchor_mask=anchor_mask,
+            raw_prototypes=raw_prototypes,
+            pln_prototypes=global_prototypes,
+            prototype_mask=prototype_mask,
         )
         norm_metrics = {
-            **prototype_norm_metrics(anchors, prefix="anchor"),
+            **prototype_norm_metrics(raw_prototypes, prefix="raw"),
+            **prototype_norm_metrics(global_prototypes, prefix="pln"),
         }
         row = {
             "round": round_id,
             **test_metrics,
             **client_metrics,
             **norm_metrics,
-            **anchor_diagnostics,
         }
         metrics.append(row)
         pd.DataFrame(metrics).set_index("round").to_csv(
@@ -694,29 +841,33 @@ def fedavg_fixmatch(alpha, args, anchor_objective):
 
         logger.info(
             "第 %d 轮准确率：\n"
-            "  global_test  模型/锚点：%s / %s\n"
-            "  labeled     模型/锚点：%s / %s\n"
-            "  u_pool      模型/锚点：%s / %s",
+            "  global_test  模型/均值原型/PLN：%s / %s / %s\n"
+            "  labeled     模型/均值原型/PLN：%s / %s / %s\n"
+            "  u_pool      模型/均值原型/PLN：%s / %s / %s",
             round_id,
             display(test_metrics["global_test_acc"]),
-            display(test_metrics["global_test_anchor_acc"]),
+            display(test_metrics["global_test_raw_prototype_acc"]),
+            display(test_metrics["global_test_pln_prototype_acc"]),
             display(client_metrics["labeled_global_model_acc"]),
-            display(client_metrics["labeled_anchor_acc"]),
+            display(client_metrics["labeled_raw_prototype_acc"]),
+            display(client_metrics["labeled_pln_prototype_acc"]),
             display(client_metrics["u_pool_global_model_acc"]),
-            display(client_metrics["u_pool_anchor_acc"]),
+            display(client_metrics["u_pool_raw_prototype_acc"]),
+            display(client_metrics["u_pool_pln_prototype_acc"]),
         )
         logger.info(
-            "第 %d 轮 anchor 训练：contrastive loss=%s，classifier loss=%s；各类锚点 L2 范数：%s",
+            "第 %d 轮各类原型 L2 范数：\n  均值：%s\n  PLN：%s",
             round_id,
-            "—"
-            if np.isnan(anchor_diagnostics["contrastive_loss"])
-            else f"{anchor_diagnostics['contrastive_loss']:.6f}",
-            "—"
-            if np.isnan(anchor_diagnostics["classifier_loss"])
-            else f"{anchor_diagnostics['classifier_loss']:.6f}",
             np.round(
                 [
-                    norm_metrics.get(f"anchor_prototype_l2_norm_class_{c}", np.nan)
+                    norm_metrics.get(f"raw_prototype_l2_norm_class_{c}", np.nan)
+                    for c in range(args.num_classes)
+                ],
+                4,
+            ).tolist(),
+            np.round(
+                [
+                    norm_metrics.get(f"pln_prototype_l2_norm_class_{c}", np.nan)
                     for c in range(args.num_classes)
                 ],
                 4,
@@ -740,7 +891,7 @@ def fedavg_fixmatch(alpha, args, anchor_objective):
     )
 
 
-def run_experiment(anchor_objective="proto"):
+if __name__ == "__main__":
     args = args_parser()
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -750,8 +901,4 @@ def run_experiment(anchor_objective="proto"):
     torch.backends.cudnn.deterministic = False
     torch.backends.cudnn.benchmark = True
 
-    run_main(lambda: fedavg_fixmatch(args.alpha, args, anchor_objective))
-
-
-if __name__ == "__main__":
-    run_experiment()
+    run_main(lambda: fedavg_fixmatch(args.alpha, args))

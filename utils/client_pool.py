@@ -47,10 +47,15 @@ class ClientTask:
     global_params: dict
     global_prototypes: object | None = None
     global_prototype_mask: object | None = None
+    global_pln_params: dict | None = None
     global_prototype_max_radius: object | None = None
     global_prototype_max_cosine_distance: object | None = None
     global_anchors: object | None = None
     global_class_dist: object | None = None
+    # FedMatch: globally broadcast parameter components and the sparse
+    # unsupervised components of the selected helper clients.
+    fedmatch_psi: dict | None = None
+    fedmatch_helpers: list | None = None
     args: object = None
 
 
@@ -66,6 +71,9 @@ class ClientResult:
     pseudo_status: list | None = None
     prototypes: object | None = None
     prototype_counts: object | None = None
+    pln_params: dict | None = None
+    pln_num_samples: int = 0
+    fedmatch_psi: dict | None = None
     class_counts: object | None = None
     eval_counts: object | None = None
     candidate_stats: object | None = None

@@ -947,7 +947,7 @@ def candidate_diagnostic_log(results, num_classes, hist_key, hits_key):
 def fedavg_fixmatch(alpha, args=None):
     if args is None:
         args = args_parser()
-    args.method = "test"
+    args.method = "test8"
     train_dataset, test_dataset = load_datasets(args)
     run = create_run(args)
     setup_logging(run.log_file, level=args.log_level)

@@ -18,16 +18,15 @@ COMMON_ARGS="--client_gpus 0,1,2,3 --gpu_processes 0:2,1:2,2:2,3:2"
 
 # 2. 待运行任务清单 (每行一个算法与独立参数，按需增删)
 TASKS=(
-    # "test.py"
-    # "sage.py"
-    "proxyfl.py"
-    # "fedavg_a.py"
-    # "fedavg_l.py"
-    # "fixmatch_gpl.py"
-    # "fixmatch_lpl.py"
-    # "fixmatch_glpl.py"
-    # "fixmatch_glpl_g.py"
-    # "fixmatch_gplpl_p.py"
+    # "test_anchor_classifier.py"
+    # "test_anchor_hybrid.py"
+    # "test_anchor_proto.py"
+    # "test_low_pln.py"
+    "test_low_proto.py"
+    "test_pln_2.py"
+    "test_proto.py"
+    "feddure.py"
+    "fedmatch.py"
 )
 
 for cmd in "${TASKS[@]}"; do

@@ -533,7 +533,7 @@ def prototype_norm_metrics(prototypes, valid_mask):
 def fedavg_fixmatch(alpha, args=None):
     if args is None:
         args = args_parser()
-    args.method = "test"
+    args.method = "test3"
     train_dataset, test_dataset = load_datasets(args)
     run = create_run(args)
     setup_logging(run.log_file, level=args.log_level)

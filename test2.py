@@ -656,7 +656,7 @@ def fedavg_fixmatch(alpha, args=None):
     """执行纯净的联邦半监督学习 (FedAvg + FixMatch)。"""
     if args is None:
         args = args_parser()
-    args.method = "test"
+    args.method = "test2"
 
     if args.dataset == "CIFAR10":
         args.num_classes = 10

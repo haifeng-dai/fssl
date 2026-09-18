@@ -133,10 +133,14 @@ class Global:
             images, labels = images.to(self.device), labels.to(self.device)
             features, logits = self.model(images)
             probs = torch.softmax(logits / self.args.T, dim=-1)
-            confidence, prediction = probs.max(dim=1)
+            _, prediction = probs.max(dim=1)
             model_correct += (prediction == labels).sum().item()
 
-            if prototypes is not None and prototype_mask is not None and prototype_mask.any():
+            if (
+                prototypes is not None
+                and prototype_mask is not None
+                and prototype_mask.any()
+            ):
                 prototype_distances = torch.cdist(features, prototypes).masked_fill(
                     ~prototype_mask.unsqueeze(0), float("inf")
                 )
@@ -148,7 +152,9 @@ class Global:
             "global_test_acc": model_correct / total,
             "global_test_mean_prototype_acc": (
                 prototype_correct / total
-                if prototypes is not None and prototype_mask is not None and prototype_mask.any()
+                if prototypes is not None
+                and prototype_mask is not None
+                and prototype_mask.any()
                 else np.nan
             ),
         }
@@ -207,9 +213,7 @@ class Local:
         self.local_model.train()
 
         training_prototypes = (
-            global_prototypes.to(self.device)
-            if global_prototypes is not None
-            else None
+            global_prototypes.to(self.device) if global_prototypes is not None else None
         )
         prototype_valid_mask = (
             global_prototype_mask.to(self.device, dtype=torch.bool)
@@ -219,7 +223,7 @@ class Local:
 
         local_steps = int(len(u_pool_dataset) / args.batch_size_local_labeled_fixmatch)
 
-        for local_epoch in range(args.local_epochs):
+        for _ in range(args.local_epochs):
             labeled_iter, u_pool_iter = iter(labeled_loader), iter(u_pool_loader)
             for _ in range(local_steps):
                 try:
@@ -247,7 +251,7 @@ class Local:
                 features = self.de_interleave(features, 2 * args.mu + 1)
                 logits = self.de_interleave(logits, 2 * args.mu + 1)
                 features_x = features[:batch_size]
-                features_u_w, features_u_s = features[batch_size:].chunk(2)
+                _, features_u_s = features[batch_size:].chunk(2)
                 logits_x = logits[:batch_size]
                 logits_u_w, logits_u_s = logits[batch_size:].chunk(2)
 
@@ -436,10 +440,10 @@ def prototype_norm_metrics(prototypes, prefix="raw"):
     return metrics
 
 
-def fedavg_fixmatch(alpha, args=None):
+def fedavg_fixmatch(alpha, args=None, method="test_proto"):
     if args is None:
         args = args_parser()
-    args.method = "test_proto"
+    args.method = method
     train_dataset, test_dataset = load_datasets(args)
     run = create_run(args)
     setup_logging(run.log_file, level=args.log_level)
