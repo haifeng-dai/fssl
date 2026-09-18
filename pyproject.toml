@@ -26,7 +26,7 @@ package = false
 
 [[tool.uv.index]]
 name = "pypi"
-url = "https://mirrors.seu.edu.cn/pypi/index"
+url = "https://mirrors.cernet.edu.cn/pypi/web/simple"
 default = true
 
 [[tool.uv.index]]
