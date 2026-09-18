@@ -152,12 +152,6 @@ def args_parser():
         help="客户端整体原型损失权重",
     )
     parser.add_argument(
-        "--prototype_contrastive_margin",
-        type=float,
-        default=10.0,
-        help="平均原型距离对比损失施加到真实类别距离上的 margin",
-    )
-    parser.add_argument(
         "--lambda_proto_high",
         type=float,
         default=1.0,
@@ -168,6 +162,12 @@ def args_parser():
         type=float,
         default=1.0,
         help="原型损失中低置信候选集合项权重",
+    )
+    parser.add_argument(
+        "--proto_temperature",
+        type=float,
+        default=0.5,
+        help="低置信候选集合的原型 logits 温度；小于 1 会使分布更尖锐",
     )
     parser.add_argument(
         "--T",

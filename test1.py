@@ -38,16 +38,21 @@ from utils.run_registry import create_run
 logger = logging.getLogger(__name__)
 
 
-def prototype_logits(features, anchors, scale):
-    """统一的尺度归一化原型 logits。"""
+def prototype_logits(features, anchors, scale, temperature=1.0):
+    """尺度归一化的原型 logits；较小温度使类别分布更尖锐。"""
     feature_dim = features.size(1)
     distances = torch.cdist(features, anchors, p=2).square() / feature_dim
-    return -distances / scale
+    temperature = torch.as_tensor(
+        temperature, device=features.device, dtype=features.dtype
+    ).clamp_min(1e-12)
+    return -distances / (scale * temperature)
 
 
-def prototype_probabilities(features, anchors, scale):
+def prototype_probabilities(features, anchors, scale, temperature=1.0):
     """所有原型概率均由统一 logits 导出。"""
-    return torch.softmax(prototype_logits(features, anchors, scale), dim=-1)
+    return torch.softmax(
+        prototype_logits(features, anchors, scale, temperature), dim=-1
+    )
 
 
 def prototype_set_loss(logits, label_sets):
@@ -377,7 +382,10 @@ class Local:
                             features_x.detach(), anchors, proto_scale
                         )
                         proto_logits_u = prototype_logits(
-                            global_features_u_w.detach(), anchors, proto_scale
+                            global_features_u_w.detach(),
+                            anchors,
+                            proto_scale,
+                            args.proto_temperature,
                         )
                         relative_distances = (
                             proto_logits_u.max(dim=1, keepdim=True).values
@@ -421,14 +429,15 @@ class Local:
 
                     # 低置信样本仅监督强增强视图：概率质量留在
                     # 候选集合内即可，不将特征拉向多个 anchor 的几何中点。
-                    low_valid = (
-                        (~high_valid) & (set_sizes <= args.proto_max_set_size)
-                    )
+                    low_valid = ~high_valid
                     L_proto_l = torch.zeros((), device=self.device)
                     if low_valid.any():
                         low_losses = prototype_set_loss(
                             prototype_logits(
-                                features_u_s[low_valid], anchors, proto_scale
+                                features_u_s[low_valid],
+                                anchors,
+                                proto_scale,
+                                args.proto_temperature,
                             ),
                             low_sets[low_valid],
                         )
@@ -480,9 +489,9 @@ class Local:
                                 .gather(1, targets_u_groundtruth[low_mask].unsqueeze(1))
                                 .squeeze(1)
                             )
-                            accepted = low_sizes <= args.proto_max_set_size
-                            num_set_accepted += int(accepted.sum().item())
-                            num_set_accepted_hits += int(gt_hits[accepted].sum().item())
+                            # 低置信样本均参与集合损失；保留参与数和覆盖率诊断。
+                            num_set_accepted += int(low_sizes.numel())
+                            num_set_accepted_hits += int(gt_hits.sum().item())
                             for size, hit in zip(low_sizes.tolist(), gt_hits.tolist()):
                                 set_size_hist[int(size)] += 1
                                 set_size_hit_hist[int(size)] += int(hit)
@@ -1087,7 +1096,7 @@ def fedavg_fixmatch(alpha, args=None):
                 f"高置信伪标签准确率 {high_acc_part}｜"
                 f"低置信原型 top-1 {proto_low_acc_part}｜"
                 f"候选集大小 {set_part}｜低置信覆盖 {hit_part}｜"
-                f"候选集采用 {set_accept_part}｜采用集合覆盖 {accepted_hit_part}｜"
+                f"候选集参与 {set_accept_part}｜参与集合覆盖 {accepted_hit_part}｜"
                 f"分桶覆盖 {acc_part}"
             )
         total_valid_part = (
@@ -1137,8 +1146,8 @@ def fedavg_fixmatch(alpha, args=None):
             f"高置信伪标签准确率 {total_high_acc_part}｜"
             f"低置信原型 top-1 {total_proto_low_part}｜"
             f"候选集大小 {total_set_part}｜低置信覆盖 {total_hit_part}｜"
-            f"候选集采用 {total_set_accept_part}｜"
-            f"采用集合覆盖 {total_accepted_hit_part}｜分桶覆盖 {total_acc_part}"
+            f"候选集参与 {total_set_accept_part}｜"
+            f"参与集合覆盖 {total_accepted_hit_part}｜分桶覆盖 {total_acc_part}"
         )
         logger.debug("第 %d 轮 u_pool 训练与候选集统计：\n%s", r, "\n".join(lines))
 

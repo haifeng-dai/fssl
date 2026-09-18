@@ -108,7 +108,7 @@ def config_fingerprint(params: dict) -> str:
     """对参数快照计算组指纹；同指纹 = 同一实验组（seed/repeat 不同的重复）。"""
     payload = {k: v for k, v in params.items() if k not in FINGERPRINT_EXCLUDE}
     text = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
-    return hashlib.md5(text.encode("utf8")).hexdigest()[:8]
+    return hashlib.md5(text.encode("utf8")).hexdigest()[:6]
 
 
 def group_runs(rows: list[dict]) -> dict[str, dict[int, list[dict]]]:
@@ -247,7 +247,7 @@ def list_runs(filters: dict[str, object]) -> None:
     )
     print(
         f"{'group':<10} {'method':<18} {'α':<6} {'K':<4} {'lr':<6} "
-        f"{'rounds':<8} {'repeats':<22} {'latest':<20} best_acc(mean±std)"
+        f"{'rounds':<8} {'repeats':<10} {'latest':<20} best_acc(mean±std)"
     )
     for fingerprint, group in ordered:
         all_runs = [run for runs in group.values() for run in runs]
@@ -275,7 +275,7 @@ def list_runs(filters: dict[str, object]) -> None:
             f"{fingerprint:<10} {(params.get('method') or '-')!s:<18} "
             f"{params.get('alpha')!s:<6} {params.get('num_clients')!s:<4} "
             f"{params.get('lr_local_training')!s:<6} {params.get('num_rounds')!s:<8} "
-            f"{repeat_desc:<22} {latest_time:<20} {best_desc}"
+            f"{repeat_desc:<10} {latest_time:<20} {best_desc}"
         )
 
 

@@ -14,20 +14,20 @@ PROJECT_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 cd "${PROJECT_DIR}"
 
 # 1. 公共默认参数 (可按需修改)
-COMMON_ARGS="--client_gpus 0,1,2,3 --gpu_processes 0:5,1:5,2:5,3:5 --seed 42"
+COMMON_ARGS="--client_gpus 0,1,2,3 --gpu_processes 0:2,1:2,2:2,3:2"
 
 # 2. 待运行任务清单 (每行一个算法与独立参数，按需增删)
 TASKS=(
-    "test.py"
-    "sage.py"
+    # "test.py"
+    # "sage.py"
     "proxyfl.py"
-    "fedavg_a.py"
-    "fedavg_l.py"
-    "fixmatch_gpl.py"
-    "fixmatch_lpl.py"
-    "fixmatch_glpl.py"
-    "fixmatch_glpl_g.py"
-    "fixmatch_gplpl_p.py"
+    # "fedavg_a.py"
+    # "fedavg_l.py"
+    # "fixmatch_gpl.py"
+    # "fixmatch_lpl.py"
+    # "fixmatch_glpl.py"
+    # "fixmatch_glpl_g.py"
+    # "fixmatch_gplpl_p.py"
 )
 
 for cmd in "${TASKS[@]}"; do

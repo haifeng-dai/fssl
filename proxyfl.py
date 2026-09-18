@@ -2,6 +2,7 @@ import copy
 import logging
 import random
 import sys
+import time
 
 import numpy as np
 import pandas as pd
@@ -65,6 +66,7 @@ class Global:
         self, list_dicts_local_params: list, list_nums_local_data: list
     ):
         """按客户端样本量执行 FedAvg，并使用聚合分类器更新 GPT。"""
+        t_fusion_0 = time.perf_counter()
         fedavg_global_params = copy.deepcopy(list_dicts_local_params[0])
         fedavg_mlp_params = {}
         for name_param in list_dicts_local_params[0]:
@@ -87,7 +89,11 @@ class Global:
                 new_key = name_param[len("classifier.") :]
                 fedavg_mlp_params[new_key] = value_global_param
 
+        t_fedavg = time.perf_counter() - t_fusion_0
+
+        t_gpt_0 = time.perf_counter()
         self.update_GPT(list_dicts_local_params, fedavg_mlp_params)
+        t_update_gpt = time.perf_counter() - t_gpt_0
         for name, param in self.GPT.named_parameters():
             full_param_name = f"classifier.{name}"
             if full_param_name in fedavg_global_params:
@@ -103,7 +109,7 @@ class Global:
                 classifier_weights = client_params["classifier.weight"]
                 all_classifier_weights.append(classifier_weights)
 
-        return fedavg_global_params, all_classifier_weights
+        return fedavg_global_params, all_classifier_weights, t_fedavg, t_update_gpt
 
     def update_GPT(self, list_dicts_local_params: list, fedavg_mlp_params: dict):
         """使用客户端分类器权重训练服务端代理分类器。"""
@@ -311,17 +317,28 @@ class Local:
         set_size_hit_hist = [0] * (args.num_classes + 1)
         pseudo_client_acc = 0.0
         u_client_valid = 0.0
+        model_counts = torch.zeros(8, device=self.device)
+
+        train_start = time.perf_counter()
+        t_data = 0.0
+        t_fwd_local = 0.0
+        t_fwd_glob = 0.0
+        t_loss_fixmatch = 0.0
+        t_loss_icpl = 0.0
+        t_stats = 0.0
+        t_bwd_opt = 0.0
+
+        local_iter = int(
+            len(data_client_unlabeled) / args.batch_size_local_labeled_fixmatch
+        )
 
         # 默认本地训练轮数为 5
         for local_epoch in range(args.local_epochs):
             labeled_iter = iter(self.labeled_trainloader)
             unlabeled_iter = iter(self.unlabeled_trainloader)
 
-            local_iter = int(
-                len(data_client_unlabeled) / args.batch_size_local_labeled_fixmatch
-            )
-
             for _ in range(local_iter):
+                t_i0 = time.perf_counter()
                 try:
                     inputs_x, targets_x = labeled_iter.__next__()
                 except StopIteration:
@@ -343,6 +360,8 @@ class Local:
                 inputs_u_s = inputs_u_s.to(self.device)
                 targets_x = targets_x.to(self.device)
                 targets_u_groundtruth = targets_u_groundtruth.to(self.device)
+                t_i1 = time.perf_counter()
+                t_data += t_i1 - t_i0
 
                 batch_size = inputs_x.shape[0]
                 inputs = self.interleave(
@@ -352,10 +371,14 @@ class Local:
                 feats, logits = self.local_model(inputs)
                 logits = self.de_interleave(logits, 2 * args.mu + 1)
                 feats = self.de_interleave(feats, 2 * args.mu + 1)
+                t_i2 = time.perf_counter()
+                t_fwd_local += t_i2 - t_i1
 
                 with torch.no_grad():
                     _, logits_glob = self.local_G(inputs)
                     logits_glob = self.de_interleave(logits_glob, 2 * args.mu + 1)
+                t_i3 = time.perf_counter()
+                t_fwd_glob += t_i3 - t_i2
 
                 logits_x = logits[:batch_size]
                 logits_u_w, logits_u_s = logits[batch_size:].chunk(2)
@@ -396,7 +419,6 @@ class Local:
                 mask_valid = torch.max(mask_local, mask_global)
                 mask_x = max_probs_x_glob.ge(args.threshold).float()
 
-                logits_u_s_probs = torch.softmax(logits_u_s, dim=-1)
                 logits_u_s_probs = torch.softmax(logits_u_s, dim=-1) + 1e-10
                 final_targets_u = (
                     targets_u_global_one_hot + 1e-10
@@ -408,6 +430,8 @@ class Local:
                     ).sum(-1)
                     * mask_valid
                 ).mean()
+                t_i4 = time.perf_counter()
+                t_loss_fixmatch += t_i4 - t_i3
 
                 projs_u = self.local_model.feat_proj(feats_u)
                 projs_x = self.local_model.feat_proj(feats_x)
@@ -426,7 +450,10 @@ class Local:
                 )
 
                 loss = Lx + args.lambda_u * Lu + args.lambda_u * Lc
+                t_i5 = time.perf_counter()
+                t_loss_icpl += t_i5 - t_i4
 
+                t_stat_start = time.perf_counter()
                 # 统计最后一个 epoch 的类别和伪标签指标
                 if local_epoch + 1 == args.local_epochs:
                     ##############
@@ -497,9 +524,28 @@ class Local:
                         num_gt_in_set_total += int(gt_hits.sum().item())
                         num_low_total += int(low_mask.sum().item())
 
+                    # 统计本地模型与全局模型在有标签/无标签数据上的分类命中数（复用当步前向结果）
+                    model_counts[0] += (logits_x.argmax(dim=1) == targets_x).sum()
+                    model_counts[1] += targets_x.numel()
+                    model_counts[2] += (
+                        logits_u_w.argmax(dim=1) == targets_u_groundtruth
+                    ).sum()
+                    model_counts[3] += targets_u_groundtruth.numel()
+                    model_counts[4] += (logits_x_glob.argmax(dim=1) == targets_x).sum()
+                    model_counts[5] += targets_x.numel()
+                    model_counts[6] += (
+                        logits_u_w_glob.argmax(dim=1) == targets_u_groundtruth
+                    ).sum()
+                    model_counts[7] += targets_u_groundtruth.numel()
+
+                t_stat_end = time.perf_counter()
+                t_stats += t_stat_end - t_stat_start
+
                 self.optimizer.zero_grad()
                 loss.backward()
                 self.optimizer.step()
+                t_i6 = time.perf_counter()
+                t_bwd_opt += t_i6 - t_stat_end
 
             # 输出最后一个本地 epoch 的伪标签指标
             if local_epoch + 1 == args.local_epochs:
@@ -510,7 +556,7 @@ class Local:
                     num_u_valid / num_pseudo_total if num_pseudo_total else 0.0
                 )
 
-        model_counts = self.model_eval(args, data_client_labeled, data_client_unlabeled)
+        model_counts = model_counts.tolist()
 
         pseudo_status = [
             num_pseudo_total,
@@ -525,6 +571,17 @@ class Local:
             num_high_corrects,
             model_counts,
         ]
+        total_time = time.perf_counter() - train_start
+        timing_stats = {
+            "t_data": t_data,
+            "t_fwd_local": t_fwd_local,
+            "t_fwd_glob": t_fwd_glob,
+            "t_loss_fixmatch": t_loss_fixmatch,
+            "t_loss_icpl": t_loss_icpl,
+            "t_stats": t_stats,
+            "t_bwd_opt": t_bwd_opt,
+            "total_time": total_time,
+        }
         return (
             {
                 name: value.detach().cpu().clone()
@@ -532,6 +589,7 @@ class Local:
             },
             pseudo_status,
             local_class_counts.cpu().numpy(),
+            timing_stats,
         )
 
     @torch.no_grad()
@@ -649,7 +707,7 @@ class ClientTrainer:
         self.local = Local(args, device=device)
 
     def train(self, task, labeled_view, unlabeled_view):
-        params, pseudo_status, class_counts = self.local.fixmatch_train(
+        params, pseudo_status, class_counts, timing_stats = self.local.fixmatch_train(
             task.args,
             labeled_view,
             unlabeled_view,
@@ -660,6 +718,8 @@ class ClientTrainer:
             "params": params,
             "pseudo_status": pseudo_status,
             "class_counts": class_counts,
+            "elapsed_seconds": timing_stats["total_time"],
+            "candidate_stats": timing_stats,
         }
 
 
@@ -837,6 +897,7 @@ def fixmatch(alpha, args=None, global_cls=Global, method="proxyfl"):
     progress = tqdm(range(1, args.num_rounds + 1), desc=args.method)
     for r in progress:
         logger.info("========== 第 %d 轮 ==========", r)
+        t_round_start = time.perf_counter()
         list_local_class_counts = []
 
         dict_global_params = global_model.download_params()
@@ -869,7 +930,9 @@ def fixmatch(alpha, args=None, global_cls=Global, method="proxyfl"):
             )
             for client in online_clients
         ]
+        t_tasks_start = time.perf_counter()
         results = worker_pool.run_round(tasks)
+        t_clients_done = time.perf_counter()
         list_dicts_local_params = [result.params for result in results]
         list_nums_local_data = [result.num_samples for result in results]
 
@@ -1023,19 +1086,98 @@ def fixmatch(alpha, args=None, global_cls=Global, method="proxyfl"):
         current_global_dist = global_model.update_global_distribution(
             current_global_dist, list_local_class_counts
         )
+        t_dist_done = time.perf_counter()
 
-        fedavg_params, all_classifier_weights = (
+        fedavg_params, all_classifier_weights, t_fedavg, t_update_gpt = (
             global_model.initialize_for_model_fusion(
                 list_dicts_local_params, list_nums_local_data
             )
         )
+        t_fusion_done = time.perf_counter()
 
         # 评估聚合后的全局模型。
         global_acc = global_model.fedavg_eval(
             copy.deepcopy(fedavg_params), data_global_test, args.batch_size_test
         )
         fedavg_acc.append(global_acc)
-        logger.info("第 %d 轮全局模型精度：%.2f%%", r, global_acc * 100)
+        t_eval_done = time.perf_counter()
+
+        t_round_total = t_eval_done - t_round_start
+        t_client_wall = t_clients_done - t_tasks_start
+        client_times = [
+            result.elapsed_seconds
+            for result in results
+            if hasattr(result, "elapsed_seconds")
+        ]
+        avg_client_time = float(np.mean(client_times)) if client_times else 0.0
+        max_client_time = float(np.max(client_times)) if client_times else 0.0
+
+        client_breakdowns = [
+            result.candidate_stats
+            for result in results
+            if getattr(result, "candidate_stats", None) is not None
+        ]
+        if client_breakdowns:
+            avg_data = float(np.mean([b["t_data"] for b in client_breakdowns]))
+            avg_fwd_loc = float(np.mean([b["t_fwd_local"] for b in client_breakdowns]))
+            avg_fwd_glob = float(np.mean([b["t_fwd_glob"] for b in client_breakdowns]))
+            avg_loss_fm = float(np.mean([b["t_loss_fixmatch"] for b in client_breakdowns]))
+            avg_loss_icpl = float(np.mean([b["t_loss_icpl"] for b in client_breakdowns]))
+            avg_bwd_opt = float(np.mean([b["t_bwd_opt"] for b in client_breakdowns]))
+            avg_stats = float(np.mean([b["t_stats"] for b in client_breakdowns]))
+        else:
+            avg_data = avg_fwd_loc = avg_fwd_glob = avg_loss_fm = avg_loss_icpl = avg_bwd_opt = avg_stats = 0.0
+
+        logger.info(
+            "第 %d 轮全局模型精度：%.2f%% (本轮总耗时: %.2fs)",
+            r,
+            global_acc * 100,
+            t_round_total,
+        )
+        logger.info(
+            "\n" + "=" * 65 + "\n"
+            "【第 %d 轮耗时细粒度定位】总耗时: %.2fs\n"
+            "  1. 客户端并行训练 (WorkerPool等待): %.2fs\n"
+            "     ├─ 单客户端耗时: 平均 %.2fs，最慢 %.2fs\n"
+            "     └─ 单客户端各阶段平均耗时:\n"
+            "        ├─ 数据读取与GPU传输 (DataLoader): %.2fs (占比 %.1f%%)\n"
+            "        ├─ 本地模型前向 (local_model):    %.2fs (占比 %.1f%%)\n"
+            "        ├─ 全局模型前向 (local_G):        %.2fs (占比 %.1f%%)\n"
+            "        ├─ FixMatch 损失 (Lx+Lu):         %.2fs (占比 %.1f%%)\n"
+            "        ├─ ICPL 投影与对比损失 (Lc):      %.2fs (占比 %.1f%%)\n"
+            "        ├─ 反向传播与优化器 (backward+step): %.2fs (占比 %.1f%%)\n"
+            "        └─ 统计指标累加计算:               %.2fs (占比 %.1f%%)\n"
+            "  2. 服务端处理与融合: %.2fs\n"
+            "     ├─ 全局类别分布更新: %.2fs\n"
+            "     ├─ FedAvg 参数加权平均: %.2fs\n"
+            "     └─ update_GPT (100轮代理优化): %.2fs\n"
+            "  3. 全局测试集评估 (fedavg_eval): %.2fs\n"
+            + "=" * 65,
+            r,
+            t_round_total,
+            t_client_wall,
+            avg_client_time,
+            max_client_time,
+            avg_data,
+            (avg_data / avg_client_time * 100) if avg_client_time else 0.0,
+            avg_fwd_loc,
+            (avg_fwd_loc / avg_client_time * 100) if avg_client_time else 0.0,
+            avg_fwd_glob,
+            (avg_fwd_glob / avg_client_time * 100) if avg_client_time else 0.0,
+            avg_loss_fm,
+            (avg_loss_fm / avg_client_time * 100) if avg_client_time else 0.0,
+            avg_loss_icpl,
+            (avg_loss_icpl / avg_client_time * 100) if avg_client_time else 0.0,
+            avg_bwd_opt,
+            (avg_bwd_opt / avg_client_time * 100) if avg_client_time else 0.0,
+            avg_stats,
+            (avg_stats / avg_client_time * 100) if avg_client_time else 0.0,
+            (t_fusion_done - t_clients_done),
+            (t_dist_done - t_clients_done),
+            t_fedavg,
+            t_update_gpt,
+            (t_eval_done - t_fusion_done),
+        )
 
         progress.set_postfix(acc=f"{global_acc:.2%}")
 
